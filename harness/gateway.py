@@ -41,8 +41,17 @@
 
 ## 只做一件事：记轨迹
 
-不解析、不改写请求体，原样转发，**响应也原样返回**。网关不会成为新的变量——上游怎么
+除了下面的按角色参数，请求体原样转发，**响应也原样返回**。网关不会成为新的变量——上游怎么
 答，调用方就看到什么。
+
+## 按角色定采样参数
+
+调用点散在各域的代码和子进程里，temperature 这类设置在那边改要改好几处。这里是所有请求都
+经过的地方：`MARENA_GATEWAY_PARAMS` 是 `{角色: {参数: 值}}` 的 JSON，写进该角色的每个
+chat completions 请求，覆盖调用方传的值。记录里的 `request` 是改写之后真正发出去的。
+
+默认只有 agent 的 temperature=1：这是 Qwen generation_config 的默认值，也是官方 MAGE 不传
+temperature 时实际用的值。上游写死的 0 让 Qwen 开着思考时约 17% 的调用陷入重复。
 
 请求头里的 `authorization` 不进日志。
 """
@@ -107,6 +116,22 @@ def upstream_base() -> str:
     return base.rstrip("/")
 
 
+DEFAULT_PARAMS = {"agent": {"temperature": 1}}
+
+
+def role_params() -> Dict[str, Dict[str, Any]]:
+    raw = os.getenv("MARENA_GATEWAY_PARAMS")
+    return json.loads(raw) if raw else DEFAULT_PARAMS
+
+
+def apply_params(role: str, rest: str, payload: bytes) -> bytes:
+    """这个角色的参数写进 chat completions 的请求体；别的请求不动。"""
+    params = role_params().get(role)
+    if not params or not rest.endswith("/chat/completions"):
+        return payload
+    return json.dumps({**json.loads(payload), **params}, ensure_ascii=False).encode()
+
+
 def _usage_of(body: bytes) -> Optional[Dict[str, Any]]:
     try:
         usage = json.loads(body).get("usage")
@@ -165,11 +190,13 @@ class Handler(BaseHTTPRequestHandler):
 
         role, rest = self._split_role(self.path)
         length = int(self.headers.get("Content-Length") or 0)
-        payload = self.rfile.read(length) if length else b""
+        payload = apply_params(role, rest, self.rfile.read(length) if length else b"")
 
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP}
         request_id = self.headers.get(runctx.HEADER)
         headers.pop(runctx.HEADER, None)         # 我们自己的头，不往上游带
+        if payload:
+            headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
         url = f"{upstream_base()}{rest}"
         started = time.time()
 
