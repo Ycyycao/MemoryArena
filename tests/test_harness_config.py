@@ -157,3 +157,4 @@ def test_every_checked_in_config_still_parses():
 def test_the_servers_get_the_local_data_paths():
     from harness import serve
     assert {"MEMORYARENA_DATA", "TRAVELPLANNER_DB"} <= set(serve.PASSTHROUGH)
+    assert {"SIMPLEMEM_TEMPLATE_THINKING", "SIMPLEMEM_MAX_TOKENS"} <= set(serve.PASSTHROUGH)
