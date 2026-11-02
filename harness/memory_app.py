@@ -4,19 +4,17 @@
 ——上游那些平级绝对导入（`from memory_systems import ...`）靠 uvicorn 把 cwd
 放进 sys.path。
 
-LLM 调用的记录挂在 litellm 的回调上（`llm_journal`），每条记录带发起它的那个请求的
-`user_id`（`runctx`），几条 run 并行时靠这个分开。
+LLM 调用带上发起它的那个请求的 `user_id`（`runctx`），几条 run 并行时网关的记录靠
+这个分开。
 
     uvicorn harness.memory_app:app --host 0.0.0.0 --port 8010
 """
 
-from . import llm_journal, runctx
+from . import runctx
 
-# 顺序：先让 litellm 的入口会打标签、线程池会传 context，再挂回调，
-# 都要在 import 上游 server 之前。
-runctx.tag_litellm()
+# 都要在 import 上游 app 之前。
+runctx.tag_openai_sdk()
 runctx.propagate_context_to_threads()
-llm_journal.install()
 
 from server import app  # noqa: E402  必须在上面几行之后
 

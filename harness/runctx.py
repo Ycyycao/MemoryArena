@@ -8,10 +8,9 @@ LLM 调用在时间上交错，事后靠时间窗或文件偏移分不开。能�
 所以做三件事，让这个 id 从请求体一路传到每条 LLM 记录上：
 
 1. **请求 → contextvar。** ASGI 中间件读请求体里的 id，放进 `REQUEST_ID`。
-2. **contextvar → litellm 调用参数。** 包一层 `litellm.completion` / `embedding`，
-   调用时把 `REQUEST_ID` 塞进 `metadata`（回调里读得到，journal 从那里取）和请求头
-   （网关读得到）。**必须在调用时打标签，不能等回调**：litellm 1.97 的同步回调是
-   `executor.submit(success_handler)`，跑在线程池里，contextvar 传不过去。
+2. **contextvar → 请求头。** 包住 openai SDK 的 `create`，调用时把 `REQUEST_ID` 放进
+   请求头 `X-Marena-Request`，网关从那里读。在调用时取，不在构造客户端时取：server
+   进程的客户端跨请求复用，而 `REQUEST_ID` 每个请求都不同。
 3. **contextvar → 工作线程。** SimpleMem 的抽取和检索都开 `ThreadPoolExecutor`，
    LLM 调用发生在 worker 线程里。给 `submit` 打补丁，用 `copy_context().run`
    提交，任何用线程池的 memory system 都不用再管这件事。
@@ -34,7 +33,6 @@ REQUEST_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "marena_request_id", default=None)
 
 ROLES = ("agent", "memory", "judge", "other")   # 网关按入口路径分的角色
-META_KEY = "marena_request_id"          # litellm metadata 里的键
 HEADER = "X-Marena-Request"             # 发给网关的请求头
 BODY_FIELDS = ("user_id", "task_id")    # 两个 server 的请求体里各有一个
 
@@ -48,76 +46,32 @@ def belongs_to(request_id: Optional[str], run_id: str) -> bool:
     return bool(request_id) and request_id.startswith(f"{run_id}__")
 
 
-# ------------------------------------------------------------------ litellm
-
-_TAGGED = False
-
-
-def tag_litellm() -> None:
-    """包住 litellm 的四个入口，调用时带上 `REQUEST_ID`。重复调用无害。
-
-    `extra_headers` 只加在 completion 上：`litellm.embedding` 的签名没有这个参数，
-    走 `**kwargs` 能不能到 provider 因后端而异，不赌。embedding 的记录靠 `metadata`
-    归因就够了——journal 抓得到；网关那份记录里 embedding 会缺 request_id，见
-    `gateway.py` 的说明。
-    """
-    global _TAGGED
-    if _TAGGED:
-        return
-    import litellm
-
-    def wrap(original: Callable[..., Any], with_header: bool) -> Callable[..., Any]:
-        @functools.wraps(original)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            rid = REQUEST_ID.get()
-            if rid:
-                metadata = dict(kwargs.get("metadata") or {})
-                metadata.setdefault(META_KEY, rid)
-                kwargs["metadata"] = metadata
-                if with_header:
-                    headers = dict(kwargs.get("extra_headers") or {})
-                    headers.setdefault(HEADER, rid)
-                    kwargs["extra_headers"] = headers
-            return original(*args, **kwargs)
-        return wrapper
-
-    litellm.completion = wrap(litellm.completion, with_header=True)
-    litellm.acompletion = wrap(litellm.acompletion, with_header=True)
-    litellm.embedding = wrap(litellm.embedding, with_header=False)
-    litellm.aembedding = wrap(litellm.aembedding, with_header=False)
-    _TAGGED = True
-
+# ------------------------------------------------------------------ openai SDK
 
 _SDK_TAGGED = False
 
 
 def tag_openai_sdk() -> None:
-    """让 openai SDK 建出来的客户端默认带上 `X-Marena-Request` 头。
-
-    只给跑 run 的进程用：上游 math agent 的工具循环直接 `OpenAI()`，不经 litellm，
-    它的调用只有网关抓得到，没有这个头网关就不知道归谁。头的值在**构造时**取——
-    跑 run 的进程里 `REQUEST_ID` 是固定的，这样取没问题；server 进程里不是，所以
-    server 不装这个。
-    """
+    """让 openai SDK 的每次调用都带上 `X-Marena-Request` 头。重复调用无害。"""
     global _SDK_TAGGED
     if _SDK_TAGGED:
         return
-    try:
-        import openai
-    except ImportError:
-        return
-    original = openai.OpenAI.__init__
+    from openai.resources.chat.completions import AsyncCompletions, Completions
+    from openai.resources.embeddings import AsyncEmbeddings, Embeddings
 
-    @functools.wraps(original)
-    def __init__(self: Any, *args: Any, **kwargs: Any) -> None:
-        rid = REQUEST_ID.get()
-        if rid:
-            headers = dict(kwargs.get("default_headers") or {})
-            headers.setdefault(HEADER, rid)
-            kwargs["default_headers"] = headers
-        original(self, *args, **kwargs)
+    def wrap(original: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(original)
+        def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+            rid = REQUEST_ID.get()
+            if rid:
+                headers = dict(kwargs.get("extra_headers") or {})
+                headers.setdefault(HEADER, rid)
+                kwargs["extra_headers"] = headers
+            return original(self, *args, **kwargs)
+        return wrapper
 
-    openai.OpenAI.__init__ = __init__  # type: ignore[method-assign]
+    for cls in (Completions, AsyncCompletions, Embeddings, AsyncEmbeddings):
+        cls.create = wrap(cls.create)  # type: ignore[method-assign]
     _SDK_TAGGED = True
 
 

@@ -58,7 +58,7 @@ def _config(collection: str, store_path: Path) -> dict:
     #
     # 更根本的理由：mem0 是**被测对象**，改它调 LLM 的方式就是改我们在测的东西，
     # 而且会和同一组用 openai provider 跑出来的 long_context / reasoningbank 失去
-    # 可比性。基础设施统一走 litellm，被测对象保持原样。
+    # 可比性。被测对象保持原样。
     #
     # 轨迹不受影响：openai provider 认 `OPENAI_BASE_URL`，照样经过网关。
     llm: dict[str, Any] = {"provider": "openai", "config": {}}
@@ -73,8 +73,7 @@ def _config(collection: str, store_path: Path) -> dict:
 
     return {
         "llm": llm,
-        # embedder 只能留在 openai：mem0 的 `embeddings/` 里没有 litellm 实现
-        # （`llms/` 里有）。它认 `OPENAI_BASE_URL`，所以照样走网关。
+        # 它认 `OPENAI_BASE_URL`，所以照样走网关。
         "embedder": {
             "provider": "openai",
             "config": {

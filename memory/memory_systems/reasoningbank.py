@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple, Optional
 # from google import genai
 # from google.genai.types import HttpOptions, GenerateContentConfig
 # from vertexai.language_models import TextEmbeddingInput, TextEmbeddingModel
-import litellm
+from openai import OpenAI
 from datetime import datetime
 import uuid
 import tiktoken
@@ -93,10 +93,7 @@ class ReasoningBankMemorySystem:
         self.embed_instruction = embed_instruction
         self.topk=topk
         # initialize LLM client
-        # Calls go through litellm, so the model name alone picks the provider
-        # (`gemini/...`, `anthropic/...`). Credentials are resolved once here.
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        self.api_base = os.getenv("OPENAI_BASE_URL")
+        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_BASE_URL"))
         
         self.user_id=user_id
         self.storage_path=os.path.join(self.storage_path , f"{self.user_id}_reasoning_bank.jsonl")
@@ -147,15 +144,11 @@ class ReasoningBankMemorySystem:
     
     def _get_openai_embedding(self, text: str, maxlen: int = 4096) -> torch.Tensor:
         """Obtain text embedding using Gemini Text Embedding Model."""
-        resp = litellm.embedding(
+        resp = self.client.embeddings.create(
             model=self.embedding_model_name,
-            api_key=self.api_key,
-            api_base=self.api_base,
             input=[text[:maxlen]], #4096 letters -> 400 tokens
         )
-        # litellm returns data entries as plain dicts, not objects with .embedding
-        # the way the openai SDK does, so index rather than attribute-access.
-        return torch.tensor([resp.data[0]["embedding"]], dtype=torch.float32)
+        return torch.tensor([resp.data[0].embedding], dtype=torch.float32)
         
         
     def _get_qwen_embedding(self, query: str) -> Tuple[torch.Tensor, str, int]:
@@ -201,10 +194,8 @@ class ReasoningBankMemorySystem:
     def _llm_judge_status(self,  trajectory: str) -> bool:
         # print("judgeing status...")
         prompt = f"Task and Trajectory:\n{trajectory}\n\nDid the agent successfully complete the task? Answer with 'success' or 'fail' only."
-        response = litellm.completion(
+        response = self.client.chat.completions.create(
             model=self.model_name,
-            api_key=self.api_key,
-            api_base=self.api_base,
             messages=[
             {"role": "system", "content": "You are a helpful assistant that judges whether the agent successfully completed the task."},
             {"role": "user", "content": prompt}
@@ -280,10 +271,8 @@ class ReasoningBankMemorySystem:
             List[str]: A list of memory item strings parsed from the LLM response.
         """
         # print("Generating Memory")
-        response = litellm.completion(
+        response = self.client.chat.completions.create(
             model=self.model_name,
-            api_key=self.api_key,
-            api_base=self.api_base,
             messages=[
             {"role": "system", "content": si.strip()},
             {"role": "user", "content": prompt}

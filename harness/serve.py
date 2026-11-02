@@ -16,7 +16,7 @@ server 是长任务，放在 tmux session `memarena` 里，进程活过当前 sh
 - **端口都在冷门段**（默认 18780/18781/18782），避开常见服务和系统临时端口
   （32768+）。改端口只改 `.env`：config 里写的是 `<MARENA_MEMORY_URL>` 占位符。
 - **两个 server 都走 `harness.*_app`，不是上游的入口。** 区别只有观测：在 import
-  上游 app 之前挂上 litellm 回调和 request-id 中间件，让并行的几条 run 分得开。
+  上游 app 之前给 openai SDK 打标签、挂 request-id 中间件，让并行的几条 run 分得开。
   memory server 的 cwd 必须切到 `MemoryArena/memory`——上游用
   `from memory_systems import ...` 这种平级绝对导入，靠 uvicorn 把 cwd 放进 sys.path。
 
@@ -54,9 +54,7 @@ PASSTHROUGH = [
     "HF_HOME", "HF_HUB_CACHE", "HF_TOKEN", "HF_ENDPOINT", "CUDA_VISIBLE_DEVICES",
     # 网关自己要知道真上游；两个 server 不需要，它们只认 OPENAI_BASE_URL
     "MARENA_GATEWAY_UPSTREAM", "MARENA_GATEWAY_PORT",
-    "LITELLM_DROP_PARAMS", "MARENA_LLM_ROLE", "MARENA_LLM_JOURNAL_DIR",
-    # litellm 路由到别家时要用的凭证
-    "VERTEX_PROJECT", "VERTEX_LOCATION", "AWS_REGION_NAME",
+    "MARENA_LLM_ROLE", "MARENA_LLM_JOURNAL_DIR",
 ]
 
 

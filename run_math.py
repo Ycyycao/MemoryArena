@@ -302,10 +302,8 @@ def main() -> None:
     # 两个 server 那边的靠带前缀的 user_id / task_id；跑完按前缀切进这条 run 的目录。
     os.environ.setdefault("MARENA_LLM_ROLE", "agent")
     runctx.REQUEST_ID.set(f"{run_id}__agent")
-    runctx.tag_litellm()
-    runctx.tag_openai_sdk()          # math agent 的工具循环直接用 openai SDK
+    runctx.tag_openai_sdk()
     runctx.propagate_context_to_threads()
-    llm_journal.install()
     journal_marks = llm_journal.marks()
 
     recorder = Recorder()

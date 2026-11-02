@@ -4,12 +4,10 @@
 那条请求的内容是一段旅行推理加一张航班表，32k 字符，4.9 秒快速失败，错误串尾巴
 带 `ip:port`——不是真的内容策略，是中转站在几条 run 并行时的误报。
 
-全部零 API 开销：litellm.completion 换成假的。
+全部零 API 开销：客户端的 `create` 换成假的。
 """
 
 import pytest
-
-import litellm
 
 from env.env_systems.travel_planner_env.clients.openai_client import OpenAIClient
 
@@ -32,7 +30,7 @@ def slept(monkeypatch):
     return delays
 
 
-def scripted(monkeypatch, *outcomes):
+def scripted(client, monkeypatch, *outcomes):
     """按脚本回应：异常就抛，别的就返回。返回调用计数器。"""
     calls = []
 
@@ -43,12 +41,12 @@ def scripted(monkeypatch, *outcomes):
             raise item
         return item
 
-    monkeypatch.setattr(litellm, "completion", fake)
+    monkeypatch.setattr(client.client.chat.completions, "create", fake)
     return calls
 
 
 def test_success_on_the_first_try_does_not_retry(client, monkeypatch, slept):
-    calls = scripted(monkeypatch, "ok")
+    calls = scripted(client, monkeypatch, "ok")
     assert client._call(model="m", messages=[]) == "ok"
     assert len(calls) == 1
     assert client.retry_count == 0
@@ -57,7 +55,7 @@ def test_success_on_the_first_try_does_not_retry(client, monkeypatch, slept):
 
 def test_retries_then_succeeds(client, monkeypatch, slept):
     """react2 那次的形状：前面失败，后面就好了。"""
-    calls = scripted(monkeypatch, Boom("400 content policy"), Boom("400"), "ok")
+    calls = scripted(client, monkeypatch, Boom("400 content policy"), Boom("400"), "ok")
     assert client._call(model="m", messages=[]) == "ok"
     assert len(calls) == 3
     assert client.retry_count == 2
@@ -65,7 +63,7 @@ def test_retries_then_succeeds(client, monkeypatch, slept):
 
 
 def test_backoff_grows_and_is_jittered(client, monkeypatch, slept):
-    scripted(monkeypatch, Boom("x"), Boom("x"), "ok")
+    scripted(client, monkeypatch, Boom("x"), Boom("x"), "ok")
     client._call(model="m", messages=[])
     base = client.RETRY_BASE_SECONDS
     # 指数 + 抖动：第 n 次落在 base*2^(n-1) 的 [0.5, 1.5) 倍区间
@@ -76,7 +74,7 @@ def test_backoff_grows_and_is_jittered(client, monkeypatch, slept):
 
 def test_exhausting_retries_reraises_the_last_error(client, monkeypatch, slept):
     """重试不是兜底：耗尽了还是要抛，让上层的 round.error 接。"""
-    calls = scripted(monkeypatch, Boom("still broken"))
+    calls = scripted(client, monkeypatch, Boom("still broken"))
     with pytest.raises(Boom, match="still broken"):
         client._call(model="m", messages=[])
     assert len(calls) == client.RETRY_ATTEMPTS
@@ -89,7 +87,7 @@ def test_retry_count_is_visible_in_usage_stats(client, monkeypatch, slept):
 
     重试最大的代价是把限速信号悄悄吃掉，那样就没法判断该不该少跑几条并行。
     """
-    scripted(monkeypatch, Boom("x"), "ok")
+    scripted(client, monkeypatch, Boom("x"), "ok")
     client._call(model="m", messages=[])
     assert client.get_usage_stats()["llm_retries"] == 1
 
@@ -98,14 +96,8 @@ def test_attempts_are_configurable(monkeypatch, slept):
     monkeypatch.setenv("OPENAI_API_KEY", "test")
     monkeypatch.setattr(OpenAIClient, "RETRY_ATTEMPTS", 1)
     c = OpenAIClient(model_name="gpt-5-mini")
-    calls = scripted(monkeypatch, Boom("x"))
+    calls = scripted(c, monkeypatch, Boom("x"))
     with pytest.raises(Boom):
         c._call(model="m", messages=[])
     assert len(calls) == 1               # 关掉重试就是只打一次
     assert slept == []
-
-
-def test_credentials_are_passed_on_every_attempt(client, monkeypatch, slept):
-    calls = scripted(monkeypatch, Boom("x"), "ok")
-    client._call(model="m", messages=[])
-    assert all("api_key" in c and "api_base" in c for c in calls)

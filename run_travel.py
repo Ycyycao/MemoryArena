@@ -215,19 +215,13 @@ def main():
             "--list 先看看有哪些组。"
         )
 
-    # 两层记录，互补：
-    #   网关   —— HTTP 层，抓所有指向它的流量，包括 mem0 那个还在用 openai SDK 的
-    #             embedder；但 provider 换成 Gemini 后流量直连 Google，它就看不到了
-    #   journal —— 挂在 litellm 上，不管打给谁都记得到
-    # 两边都常开、都落 _llm/，每条记录带 request_id；跑完按 run-id 前缀切进这条 run
-    # 的目录。agent 进程自己的调用打 `<run-id>__agent`，server 那边的靠请求体里带
+    # LLM 调用记录在网关（HTTP 层），每条带 request_id；跑完按 run-id 前缀切进这条 run
+    # 的目录。agent 进程自己的调用打 `<run-id>__agent`，server 那边的靠请求体里带 run-id
     # 前缀的 user_id / task_id，见 harness.runctx。
     os.environ.setdefault("MARENA_LLM_ROLE", "agent")
     runctx.REQUEST_ID.set(f"{run_id}__agent")
-    runctx.tag_litellm()
-    runctx.tag_openai_sdk()      # 上游还有直接用 openai SDK 的调用点，网关靠这个头归因
+    runctx.tag_openai_sdk()
     runctx.propagate_context_to_threads()
-    llm_journal.install()
     journal_marks = llm_journal.marks()
 
     recorder = Recorder()

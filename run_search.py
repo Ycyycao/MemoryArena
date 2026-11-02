@@ -309,10 +309,8 @@ def main():
     # 子进程里（agent/search.py），归属靠 runctx.child_env 往下传，见那里的说明。
     os.environ.setdefault("MARENA_LLM_ROLE", "agent")
     runctx.REQUEST_ID.set(f"{run_id}__agent")
-    runctx.tag_litellm()
     runctx.tag_openai_sdk()
     runctx.propagate_context_to_threads()
-    llm_journal.install()
     journal_marks = llm_journal.marks()
     recorder = Recorder()
 

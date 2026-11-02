@@ -185,7 +185,6 @@ dependencies:
       - letta==0.10.0
       - letta-client==1.7.1
       - limits==4.8.0
-      - litellm==1.81.0
       - llama-cloud==0.1.35
       - llama-cloud-services==0.6.54
       - llama-index==0.12.42

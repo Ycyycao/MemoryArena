@@ -106,3 +106,29 @@ def test_a_broken_line_does_not_sink_the_harvest(journal, tmp_path):
 
 def test_marks_on_an_empty_dir_is_empty(journal):
     assert llm_journal.marks() == {}
+
+
+# --------------------------------------------------------------- 请求头
+
+def test_the_sdk_sends_the_request_id_of_each_call_on_a_shared_client(monkeypatch):
+    """server 进程的客户端跨请求复用，所以头要在调用时取，不能在构造时取。"""
+    import httpx
+    import openai
+
+    runctx.tag_openai_sdk()
+    seen = []
+
+    def reply(request):
+        seen.append(request.headers.get(runctx.HEADER))
+        return httpx.Response(200, json={"id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                                         "choices": [{"index": 0, "finish_reason": "stop",
+                                                      "message": {"role": "assistant", "content": "ok"}}]})
+
+    client = openai.OpenAI(api_key="k", base_url="http://gateway/agent",
+                           http_client=httpx.Client(transport=httpx.MockTransport(reply)))
+    for rid in ("run1__a", "run2__b"):
+        token = runctx.REQUEST_ID.set(rid)
+        client.chat.completions.create(model="m", messages=[])
+        runctx.REQUEST_ID.reset(token)
+    client.chat.completions.create(model="m", messages=[])
+    assert seen == ["run1__a", "run2__b", None]

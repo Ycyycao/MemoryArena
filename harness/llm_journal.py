@@ -1,26 +1,13 @@
-"""把每一次 LLM 调用记下来，不管打给哪家。
+"""按 run 切 LLM 调用记录。
 
-三个进程（agent / memory server / env server）都会调大模型。要复盘"这一步为什么这么
-做"，光有接口层的事件不够，得有真正发出去的 messages 和真正收回来的响应。
-
-之前这件事由 `harness.gateway` 做——它夹在中间，把 HTTP 流量抄一份。那有个洞：网关只在
-目标是 OpenAI 协议时才会经过。一旦 litellm 把调用路由到 Gemini，流量直接打给 Google，
-绕开网关，什么都记不到。
-
-这里换个位置：挂在 litellm 自己身上。litellm 每次调用结束都会回调，那时候
-provider 已经不重要了——不管打给谁，回调都会来。
-
-两层现在是互补的，各自补对方的洞：
-
-| | 抓得到 |
-| --- | --- |
-| 网关（HTTP 层） | 指向它的所有流量，**包括 mem0 那个还在用 openai SDK 的 embedder** |
-| 这里（litellm 回调） | 所有走 litellm 的调用，**不管什么 provider** |
+三个进程（agent / memory server / env server）都会调大模型，它们的 `OPENAI_BASE_URL`
+都指向 `harness.gateway`。网关把每条请求和响应落到 `$MARENA_RESULTS/_llm/gateway.jsonl`，
+这里负责把属于某条 run 的记录切出来。
 
 ## 怎么归到某一次 run 名下
 
-不做启停控制面。三个进程各自**一直**往 `$MARENA_RESULTS/_llm/<role>.jsonl` 追加，
-每条记录带一个 `request_id`——由 `harness.runctx` 在调用 litellm 时塞进 `metadata`，
+不做启停控制面。网关**一直**往 `$MARENA_RESULTS/_llm/gateway.jsonl` 追加，
+每条记录带一个 `request_id`——由 `harness.runctx` 在调用 openai SDK 时放进请求头，
 形如 `<run-id>__...`。run 跑完，`harvest` 把带自己前缀的记录切进这条 run 的目录
 （`llm_calls.<role>.jsonl`）。
 
@@ -47,7 +34,6 @@ from typing import Any, Dict, Optional
 from . import runctx
 
 _LOCK = threading.Lock()
-_INSTALLED = False
 
 
 def _role() -> str:
@@ -66,63 +52,6 @@ def journal_path(role: Optional[str] = None) -> Path:
     return journal_dir() / f"{role or _role()}.jsonl"
 
 
-def _dump(obj: Any) -> Any:
-    """litellm 传回来的可能是 pydantic 模型、dict，也可能是别的。都变成能 json 的。"""
-    for attr in ("model_dump", "dict"):
-        method = getattr(obj, attr, None)
-        if callable(method):
-            try:
-                return method()
-            except Exception:
-                pass
-    if isinstance(obj, (dict, list, str, int, float, bool)) or obj is None:
-        return obj
-    return str(obj)[:4000]
-
-
-class _Journal:
-    """litellm 的 CustomLogger 子类。成功和失败都记——失败那条往往才是要复盘的。"""
-
-    def _write(self, kwargs: Dict[str, Any], response_obj: Any,
-               start_time: Any, end_time: Any, ok: bool) -> None:
-        # litellm 把请求参数原样放在 kwargs 里；`litellm_params` 那堆是它自己的内部
-        # 记账（重试次数、fallback 之类），对复盘没用，滤掉。
-        request = {k: _dump(v) for k, v in kwargs.items()
-                   if k in ("model", "messages", "input", "tools", "tool_choice",
-                            "temperature", "max_tokens", "max_completion_tokens",
-                            "response_format")}
-        response = _dump(response_obj)
-        usage = response.get("usage") if isinstance(response, dict) else None
-        metadata = (kwargs.get("litellm_params") or {}).get("metadata") or {}
-
-        record = {
-            "t": start_time.timestamp() if hasattr(start_time, "timestamp") else None,
-            "source": "litellm",
-            "role": _role(),
-            "request_id": metadata.get(runctx.META_KEY),
-            "ok": ok,
-            "duration": (end_time - start_time).total_seconds()
-            if hasattr(end_time, "__sub__") and hasattr(start_time, "__sub__") else None,
-            "request": request,
-            "response": response,
-            "usage": usage,
-        }
-        append_line(journal_path(), json.dumps(record, ensure_ascii=False, default=str))
-
-    # litellm 调用的四个钩子
-    def log_success_event(self, kwargs, response_obj, start_time, end_time):
-        self._write(kwargs, response_obj, start_time, end_time, ok=True)
-
-    def log_failure_event(self, kwargs, response_obj, start_time, end_time):
-        self._write(kwargs, response_obj, start_time, end_time, ok=False)
-
-    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
-        self._write(kwargs, response_obj, start_time, end_time, ok=True)
-
-    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
-        self._write(kwargs, response_obj, start_time, end_time, ok=False)
-
-
 def append_line(path: Path, line: str) -> None:
     """一次 write 追加一整行，跨进程不交错。"""
     data = (line + "\n").encode("utf-8")
@@ -132,19 +61,6 @@ def append_line(path: Path, line: str) -> None:
             os.write(fd, data)
         finally:
             os.close(fd)
-
-
-def install() -> None:
-    """把回调挂到 litellm 上。重复调用无害。"""
-    global _INSTALLED
-    if _INSTALLED:
-        return
-    import litellm
-    from litellm.integrations.custom_logger import CustomLogger
-
-    journal = type("MarenaJournal", (_Journal, CustomLogger), {})()
-    litellm.callbacks = list(getattr(litellm, "callbacks", None) or []) + [journal]
-    _INSTALLED = True
 
 
 # ------------------------------------------------------------------ 切片

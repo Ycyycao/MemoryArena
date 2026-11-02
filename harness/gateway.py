@@ -30,29 +30,19 @@
 
 ## 归到哪条 run：看请求头
 
-记录常开，全部落 `$MARENA_RESULTS/_llm/gateway.jsonl`，和 litellm 回调那份放一起。
-每条带 `request_id`，从请求头 `X-Marena-Request` 读——`harness.runctx` 包住的 litellm
+记录常开，全部落 `$MARENA_RESULTS/_llm/gateway.jsonl`。
+每条带 `request_id`，从请求头 `X-Marena-Request` 读——`harness.runctx` 包住的 openai SDK
 调用会带上这个头，值是 `<run-id>__...`。run 跑完由 `llm_journal.harvest` 按前缀切走。
 
 之前是一个 `record/start|stop` 控制面，一次只能录一条 run，第二条一启动就把第一条
 截断了；几条 run 并行之后没法用，删了。
 
-没带这个头的请求（mem0 那个 openai SDK 的 embedder；litellm 的 `embedding()` 签名
-没有 `extra_headers`，也不加）记录里 `request_id` 为空，不归任何 run。
+没带这个头的请求记录里 `request_id` 为空，不归任何 run。
 
 ## 只做一件事：记轨迹
 
 不解析、不改写请求体，原样转发，**响应也原样返回**。网关不会成为新的变量——上游怎么
 答，调用方就看到什么。
-
-**换 provider 不归它管。** 调用点自己用的就是 litellm（`travel_planner_env/clients/
-openai_client.py`、`memory_systems/reasoningbank.py`、`formal_reasoning_env/
-llm_backend.py`，以及 mem0 的 `provider: litellm`），换后端是改模型名。网关一度也有
-个 litellm 路由模式，调用点转过来之后那就是同一件事做两遍，删掉了。
-
-留着网关是因为 **litellm 的回调只能抓到走 litellm 的调用**，而 mem0 的 embedder 仍然
-是 openai SDK（mem0 的 `embeddings/` 里没有 litellm 实现）。网关在 HTTP 那一层，抓得
-到所有人。
 
 请求头里的 `authorization` 不进日志。
 """

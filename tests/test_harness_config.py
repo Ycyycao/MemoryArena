@@ -33,7 +33,7 @@ def test_missing_env_var_is_a_hard_stop(monkeypatch):
 
 
 def test_empty_env_var_counts_as_missing(monkeypatch):
-    """空串当没设置——否则 base_url 会变成空串，报错跑到 litellm 里才出现。"""
+    """空串当没设置——否则 base_url 会变成空串，报错跑到 SDK 里才出现。"""
     monkeypatch.setenv("EMPTY_ONE", "")
     with pytest.raises(SystemExit):
         config_mod._resolve({"a": "<EMPTY_ONE>"})

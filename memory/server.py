@@ -1,3 +1,4 @@
+import importlib
 import os
 from typing import Dict, Callable, NamedTuple
 
@@ -6,20 +7,27 @@ from pydantic import BaseModel
 import uvicorn
 from dotenv import load_dotenv
 
-from memory_systems import (
-    LongContextMemorySystem, 
-    MirixMemorySystem, 
-    Mem0MemorySystem, 
-    LettaMemorySystem, 
-    RAGMemorySystem, 
-    MemoRAGMemorySystem,
-    GraphRAGMemorySystem,
-    AMemMemorySystem,
-    LightMemMemorySystem,
-    ReasoningBankMemorySystem,
-    ZepMemorySystem,
-)
 
+
+def _lazy(module: str, cls: str) -> Callable[..., object]:
+    """Import a memory system when it is created: each one brings its own dependencies."""
+    def create(*args, **kwargs):
+        mod = importlib.import_module(f"memory_systems.{module}")
+        return getattr(mod, cls)(*args, **kwargs)
+    return create
+
+
+LongContextMemorySystem = _lazy("long_context", "LongContextMemorySystem")
+MirixMemorySystem = _lazy("mirix", "MirixMemorySystem")
+Mem0MemorySystem = _lazy("mem0", "Mem0MemorySystem")
+LettaMemorySystem = _lazy("letta", "LettaMemorySystem")
+RAGMemorySystem = _lazy("rag", "RAGMemorySystem")
+MemoRAGMemorySystem = _lazy("memorag", "MemoRAGMemorySystem")
+GraphRAGMemorySystem = _lazy("langchain_graphrag", "GraphRAGMemorySystem")
+AMemMemorySystem = _lazy("amem", "AMemMemorySystem")
+LightMemMemorySystem = _lazy("lightmem", "LightMemMemorySystem")
+ReasoningBankMemorySystem = _lazy("reasoningbank", "ReasoningBankMemorySystem")
+ZepMemorySystem = _lazy("zep", "ZepMemorySystem")
 
 load_dotenv()
 

@@ -1,13 +1,6 @@
 """
 OpenAI Client - Implementation of BaseModelClient for OpenAI-compatible APIs
-
-Calls go through litellm rather than the openai SDK, so the same client reaches
-OpenAI, Gemini, Anthropic, Bedrock, Vertex and the rest by model name alone
-(`gemini/gemini-2.5-flash`, `anthropic/claude-...`). litellm returns an
-OpenAI-shaped response, so everything downstream of the call is unchanged.
-
-The class name stays OpenAIClient because `travel_planner.py` selects it by
-`backend: openai`; it is no longer OpenAI-specific.
+Supports OpenAI's Tools API (function calling)
 """
 
 import os
@@ -15,8 +8,7 @@ import json
 import random
 import time
 from typing import List, Dict, Optional
-
-import litellm
+from openai import OpenAI
 
 from .base_client import BaseModelClient, ModelResponse, ToolCall
 from ..cost_tracker import CostTracker
@@ -29,12 +21,14 @@ class OpenAIClient(BaseModelClient):
     
     def __init__(self, model_name: str = "gpt-4o-mini", api_key: str = None, base_url: str = None):
         super().__init__(model_name)
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         # OPENAI_BASE_URL is the name the openai SDK itself uses; OPENAI_API_BASE
         # is kept as a fallback because the original code read only that one.
-        self.api_base = (base_url
-                         or os.environ.get("OPENAI_BASE_URL")
-                         or os.environ.get("OPENAI_API_BASE"))
+        self.client = OpenAI(
+            api_key=api_key or os.environ.get("OPENAI_API_KEY"),
+            base_url=(base_url
+                      or os.environ.get("OPENAI_BASE_URL")
+                      or os.environ.get("OPENAI_API_BASE")),
+        )
         self.cost_tracker = CostTracker(model_name)
         self.retry_count = 0
 
@@ -51,12 +45,11 @@ class OpenAIClient(BaseModelClient):
     RETRY_BASE_SECONDS = float(os.getenv("MARENA_LLM_RETRY_BASE", "4"))
 
     def _call(self, **kwargs):
-        """One place that talks to litellm, so credentials are not repeated."""
+        """One place that talks to the API, so retries are not repeated."""
         last = None
         for attempt in range(1, self.RETRY_ATTEMPTS + 1):
             try:
-                return litellm.completion(
-                    api_key=self.api_key, api_base=self.api_base, **kwargs)
+                return self.client.chat.completions.create(**kwargs)
             except Exception as exc:
                 last = exc
                 self.retry_count += 1
