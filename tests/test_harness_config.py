@@ -152,3 +152,8 @@ def test_every_checked_in_config_still_parses():
         # agent_mode 可以不写（默认 toolcall），写了就必须是认得的值
         mode = cfg["agent"].get("agent_mode", "toolcall")
         assert mode in {"toolcall", "react"}, (f, mode)
+
+
+def test_the_servers_get_the_local_data_paths():
+    from harness import serve
+    assert {"MEMORYARENA_DATA", "TRAVELPLANNER_DB"} <= set(serve.PASSTHROUGH)

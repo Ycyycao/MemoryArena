@@ -50,6 +50,8 @@ PASSTHROUGH = [
     "MARENA_RESULTS", "MARENA_MEMORY_STATE", "MARENA_REASONINGBANK_MODEL",
     "MARENA_MEM0_MODEL", "MARENA_MEM0_EMBEDDING", "MARENA_MEM0_HOSTED",
     "MARENA_SIMPLEMEM_MODEL", "MARENA_SIMPLEMEM_EMBEDDING",
+    # env server 读本地数据；没有它就回落 HuggingFace，离线时 /env/initialize 直接 500
+    "MEMORYARENA_DATA", "TRAVELPLANNER_DB",
     # SimpleMem 的 embedding 是本地 SentenceTransformers，要读 HF 缓存和挑卡
     "HF_HOME", "HF_HUB_CACHE", "HF_TOKEN", "HF_ENDPOINT", "CUDA_VISIBLE_DEVICES",
     # 网关自己要知道真上游；两个 server 不需要，它们只认 OPENAI_BASE_URL
