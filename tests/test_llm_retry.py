@@ -101,3 +101,20 @@ def test_attempts_are_configurable(monkeypatch, slept):
         c._call(model="m", messages=[])
     assert len(calls) == 1               # 关掉重试就是只打一次
     assert slept == []
+
+
+def reply():
+    from types import SimpleNamespace as NS
+    return NS(usage=None, choices=[NS(finish_reason="stop", message=NS(content="ok", tool_calls=None))])
+
+
+def test_agent_temperature_defaults_to_one_and_can_be_set(client, monkeypatch):
+    calls = scripted(client, monkeypatch, reply())
+    client.model_name = "qwen"
+    client.chat_with_tools([], [])
+    assert calls[-1]["temperature"] == 1.0
+    monkeypatch.setattr(OpenAIClient, "AGENT_TEMPERATURE", 0.0)   # MARENA_AGENT_TEMPERATURE=0: upstream's value
+    client.chat_with_tools([], [])
+    assert calls[-1]["temperature"] == 0.0
+    client.chat_with_tools([], [], temperature=0.5)
+    assert calls[-1]["temperature"] == 0.5

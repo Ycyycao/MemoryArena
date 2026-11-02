@@ -41,6 +41,10 @@ class OpenAIClient(BaseModelClient):
     # 也只是多花三次的钱、结果一样。重试次数会打到 stderr 并计数（retry_count），
     # 跑完在 usage_stats.json 里看得到——**不要让重试把限速信号吃掉**，那个信号是
     # 判断"要不要少跑几条并行"的唯一依据。
+    # 上游这里是 0。Qwen 开着思考时，0 下有约 17% 的调用陷入重复直到写满上限；1 是模型
+    # generation_config 的默认值，也是官方 MAGE 不传 temperature 时实际用的值。
+    AGENT_TEMPERATURE = float(os.getenv("MARENA_AGENT_TEMPERATURE", "1"))
+
     RETRY_ATTEMPTS = int(os.getenv("MARENA_LLM_RETRIES", "3"))
     RETRY_BASE_SECONDS = float(os.getenv("MARENA_LLM_RETRY_BASE", "4"))
 
@@ -68,12 +72,14 @@ class OpenAIClient(BaseModelClient):
         self,
         messages: List[Dict],
         tools: List[Dict],
-        temperature: float = 0.0,
+        temperature: float = None,
         max_tokens: int = 32768
     ) -> ModelResponse:
         """
         Send messages to OpenAI with tools enabled.
         """
+        if temperature is None:
+            temperature = self.AGENT_TEMPERATURE
         try:
             if self.model_name.startswith('gpt-5'):
                 # gpt-5 系列: 用 max_completion_tokens, 不传 temperature
