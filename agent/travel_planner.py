@@ -25,6 +25,11 @@ class AgentStep:
     tool_results: Optional[List[Dict]]
     final_output: Optional[str]
     raw_response: Optional[Dict] = None
+    # use_step_memory 打开时，这一步循环内注入的记忆原文。合并 src/ 那轮以后，
+    # 循环里的 memory_system.wrap_user_prompt() 没有任何地方记，落盘的轨迹里
+    # 看不到它注入过什么。挂在步上而不是发一条 memory.wrap_user_prompt 事件：
+    # trace_prep 的一轮是按那个事件开的，多发一次就多算一轮。
+    step_memory: Optional[str] = None
 
 
 @dataclass
@@ -103,7 +108,7 @@ class TravelPlannerAgent(BaseAgent):
         )
 
         self.base_messages = [
-            {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+            {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": base_context},
         ]
         self.accumulated_plans = plan
@@ -150,6 +155,30 @@ class TravelPlannerAgent(BaseAgent):
         if self._last_result is None:
             return []
         return self._scratchpad_to_dict(self._last_result.scratchpad, model_type=model_type)
+
+    # --- 给子类换范式用的两个钩子。默认实现就是原来那两行，行为不变。 ---
+
+    def _get_response(self, messages: List[Dict], step: "AgentStep"):
+        """发一轮请求。子类可以在这里加重试、改采样参数、检查回复形状。"""
+        return self.client.chat_with_tools(messages, TOOLS)
+
+    def _split_final_message(self, content: str, name: str):
+        """把终局消息拆成 (推理, 计划)。
+
+        默认不拆：原路径下模型只在最后一条写字，那条就是计划本身。返回 `None`
+        表示"没有可分离的推理"，调用处据此不动 `step.thought`，所以原路径落盘
+        形状逐字不变。
+        """
+        return None, content
+
+    def _format_assistant_turn(self, response) -> Dict:
+        """把模型这一轮的回复写回消息历史。
+
+        默认走 client 的 `format_assistant_tool_calls`，它把 `content` 写成 None
+        ——原路径下模型本来也不写文字，没有损失。范式要求模型边想边调工具时，
+        这里得把 content 一起带上，否则它自己的推理下一轮就看不见了。
+        """
+        return self.client.format_assistant_tool_calls(response.tool_calls)
 
     def run_single_person(
         self,
@@ -198,7 +227,7 @@ class TravelPlannerAgent(BaseAgent):
                 raw_response=None,
             )
 
-            response = self.client.chat_with_tools(messages, TOOLS)
+            response = self._get_response(messages, step)
 
             print(f"\n[DEBUG Step {step_idx}]")
             print(f"  content: {repr(response.content)[:200] if response.content else None}")
@@ -222,7 +251,7 @@ class TravelPlannerAgent(BaseAgent):
                     for tc in response.tool_calls
                 ]
 
-                messages.append(self.client.format_assistant_tool_calls(response.tool_calls))
+                messages.append(self._format_assistant_turn(response))
 
                 step.tool_results = []
                 for tc in response.tool_calls:
@@ -240,15 +269,23 @@ class TravelPlannerAgent(BaseAgent):
                     wrapped = memory_system.wrap_user_prompt(query)
                     step_memory = wrapped.split("</memory_context>")[0] + "</memory_context>"
                     step_memory = step_memory.strip()
+                    step.step_memory = step_memory
                     messages.append({
                         "role": "user",
                         "content": f"[Step Memory] Updated context from memory:\n\n{step_memory}",
                     })
 
             else:
-                step.final_output = response.content
+                preamble, plan = self._split_final_message(response.content, name)
+                if preamble is not None:
+                    # 推理和计划在同一条消息里。thought 留推理，final_plan 只留计划：
+                    # env 侧 _parse_person_plan_from_result 用 re.search 取第一个
+                    # `=== X's Plan ===`，推理里只要复述过这个标记，判分就会落在
+                    # 那段议论文上，18 格全错。
+                    step.thought = preamble
+                step.final_output = plan
                 result.scratchpad.append(step)
-                result.final_plan = response.content or ""
+                result.final_plan = plan or ""
                 result.total_steps = step_idx + 1
                 break
 

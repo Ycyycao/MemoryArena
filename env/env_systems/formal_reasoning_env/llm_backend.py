@@ -1,30 +1,18 @@
 """
 LLM Backend Support for Multiple Providers
 Adapted from /home/zexueh/orcd/pool/memact/evaluation/core/llm_backend.py
+
+Every provider goes through litellm. There used to be one class per vendor, each
+with its own SDK and its own message-format conversion; litellm speaks all of
+them and takes OpenAI-shaped messages, so a single backend covers the lot and
+`backend_name` only decides which model prefix and which credentials to use.
 """
 
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional
 import os
 
-try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
-
-try:
-    import anthropic
-    ANTHROPIC_AVAILABLE = True
-except ImportError:
-    ANTHROPIC_AVAILABLE = False
-
-try:
-    from google import genai
-    from google.genai.types import GenerateContentConfig
-    GOOGLE_AVAILABLE = True
-except ImportError:
-    GOOGLE_AVAILABLE = False
+import litellm
 
 
 class LLMBackend(ABC):
@@ -42,108 +30,23 @@ class LLMBackend(ABC):
         raise NotImplementedError("Subclasses should implement this method")
 
 
-class OpenAIBackend(LLMBackend):
-    """OpenAI backend with support for custom base URLs."""
-    
-    def __init__(
-        self,
-        model_name: str = "gpt-4.1-mini",
-        max_tokens: int = 2000,
-        temperature: float = 0.0,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None
-    ):
-        if not OPENAI_AVAILABLE:
-            raise ImportError("openai package is required. Install with: pip install openai")
-        
-        self.client = OpenAI(
-            api_key=api_key if api_key else os.getenv("OPENAI_API_KEY"),
-            base_url=base_url if base_url else os.getenv("OPENAI_BASE_URL")
-        )
-        self.model_name = model_name
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-    
-    def chat(
-        self,
-        messages: List[Dict[str, str]],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        **kwargs
-    ) -> str:
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=messages,
-            temperature=temperature if temperature is not None else self.temperature,
-            max_completion_tokens=max_tokens if max_tokens is not None else self.max_tokens,
-            **kwargs
-        )
-        return response.choices[0].message.content.strip()
+class LiteLLMBackend(LLMBackend):
+    """One backend for every provider; litellm routes by the model name."""
 
-
-class AnthropicBackend(LLMBackend):
-    """Anthropic Claude backend."""
-    
-    def __init__(
-        self,
-        model_name: str = "claude-3-5-sonnet-20241022",
-        temperature: float = 0.0,
-        max_tokens: int = 2000,
-        api_key: Optional[str] = None
-    ):
-        if not ANTHROPIC_AVAILABLE:
-            raise ImportError("anthropic package is required. Install with: pip install anthropic")
-        
-        self.client = anthropic.Anthropic(
-            api_key=api_key if api_key else os.getenv("ANTHROPIC_API_KEY")
-        )
-        self.model_name = model_name
-        self.max_tokens = max_tokens
-        self.temperature = temperature
-    
-    def chat(
-        self,
-        messages: List[Dict[str, str]],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        **kwargs
-    ) -> str:
-        # Convert OpenAI-style messages to Anthropic format
-        system_message = messages[0]['content'] if messages[0]['role'] == "system" else "You are a helpful assistant."
-        user_messages = messages[1:] if messages[0]['role'] == "system" else messages
-        
-        response = self.client.messages.create(
-            model=self.model_name,
-            max_tokens=max_tokens if max_tokens is not None else self.max_tokens,
-            system=system_message,
-            messages=user_messages,
-            temperature=temperature if temperature is not None else self.temperature,
-            **kwargs
-        )
-        return response.content[0].text.strip()
-
-
-class OpenRouterBackend(LLMBackend):
-    """OpenRouter backend for accessing multiple models."""
-    
     def __init__(
         self,
         model_name: str,
         temperature: float = 0.0,
         max_tokens: int = 2000,
-        api_key: Optional[str] = None
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
     ):
-        if not OPENAI_AVAILABLE:
-            raise ImportError("openai package is required. Install with: pip install openai")
-        
-        self.client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=api_key if api_key else os.environ["OPENROUTER_API_KEY"]
-        )
         self.model_name = model_name
-        self.max_tokens = max_tokens
         self.temperature = temperature
-    
+        self.max_tokens = max_tokens
+        self.api_key = api_key
+        self.api_base = base_url
+
     def chat(
         self,
         messages: List[Dict[str, str]],
@@ -151,62 +54,46 @@ class OpenRouterBackend(LLMBackend):
         max_tokens: Optional[int] = None,
         **kwargs
     ) -> str:
-        response = self.client.chat.completions.create(
+        response = litellm.completion(
             model=self.model_name,
+            api_key=self.api_key,
+            api_base=self.api_base,
             messages=messages,
             temperature=temperature if temperature is not None else self.temperature,
-            max_completion_tokens=max_tokens if max_tokens is not None else self.max_tokens,
+            max_tokens=max_tokens if max_tokens is not None else self.max_tokens,
             **kwargs
         )
-        return response.choices[0].message.content.strip()
+        # Providers return None rather than "" when a response is cut short
+        # (finish_reason="length") or filtered, and .strip() on None throws.
+        return (response.choices[0].message.content or "").strip()
 
 
-class GoogleGeminiBackend(LLMBackend):
-    """Google Gemini backend."""
-    
-    def __init__(
-        self,
-        model_name: str = "gemini-1.5-pro",
-        temperature: float = 0.0,
-        max_tokens: int = 2000,
-        api_key: Optional[str] = None
-    ):
-        if not GOOGLE_AVAILABLE:
-            raise ImportError("google-genai package is required. Install with: pip install google-genai")
-        
-        import google.generativeai
-        google.generativeai.configure(api_key=api_key if api_key else os.getenv("GOOGLE_API_KEY"))
-        
-        self.model_name = model_name
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        self.client = genai.Client()
-    
-    def chat(
-        self,
-        messages: List[Dict[str, str]],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        **kwargs
-    ) -> str:
-        # Convert messages to Gemini format
-        prompt = "\n".join([f"{msg['role'].upper()}: {msg['content']}" for msg in messages])
-        
-        # Extract system instruction if present
-        system_instruction = None
-        if messages and messages[0]['role'] == 'system':
-            system_instruction = [messages[0]['content']]
-        
-        response = self.client.models.generate_content(
-            model=self.model_name,
-            contents=prompt,
-            config=GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=temperature if temperature is not None else self.temperature,
-                max_output_tokens=max_tokens if max_tokens is not None else self.max_tokens
-            )
-        )
-        return response.text.strip()
+# What each backend_name means: the model prefix litellm needs (when the caller
+# has not written one already) and where the credentials come from.
+_PROVIDERS = {
+    "openai":     {"prefix": "",            "key": ("OPENAI_API_KEY",),
+                   "base": ("OPENAI_BASE_URL", "OPENAI_API_BASE")},
+    "anthropic":  {"prefix": "anthropic/",  "key": ("ANTHROPIC_API_KEY",), "base": ()},
+    "openrouter": {"prefix": "openrouter/", "key": ("OPENROUTER_API_KEY",),
+                   "base": ("OPENROUTER_API_BASE_URL",)},
+    "gemini":     {"prefix": "gemini/",     "key": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+                   "base": ("GEMINI_BASE_URL",)},
+    "google":     {"prefix": "gemini/",     "key": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+                   "base": ("GEMINI_BASE_URL",)},
+}
+
+
+def _first_env(names) -> Optional[str]:
+    """First of `names` that is set, with any trailing slash removed.
+
+    litellm joins the base with its own path, so a base ending in "/" produces
+    a double slash ("/v1//models/...") that some gateways reject outright.
+    """
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value.rstrip("/")
+    return None
 
 
 def create_backend(
@@ -218,44 +105,33 @@ def create_backend(
 ) -> LLMBackend:
     """
     Factory function to create LLM backend instances.
-    
+
     Args:
-        backend_name: Name of the backend ('openai', 'anthropic', 'openrouter', 'gemini')
-        model_name: Model name to use
+        backend_name: 'openai', 'anthropic', 'openrouter', 'gemini' (or 'google')
+        model_name: Model name to use. A name that already carries a litellm
+            provider prefix ("gemini/gemini-2.5-flash") is passed through as-is,
+            so backend_name only matters for names without one.
         temperature: Sampling temperature
         max_tokens: Maximum tokens to generate
-        **kwargs: Additional backend-specific arguments
-    
+        **kwargs: Passed to the backend (api_key, base_url)
+
     Returns:
         LLMBackend instance
     """
-    backend_name = backend_name.lower()
-    
-    if backend_name == "openai":
-        return OpenAIBackend(
-            model_name=model_name,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **kwargs
+    provider = _PROVIDERS.get(backend_name.lower())
+    if provider is None:
+        raise ValueError(
+            f"Unknown backend: {backend_name}. "
+            f"Supported: openai, anthropic, openrouter, gemini"
         )
-    elif backend_name == "anthropic":
-        return AnthropicBackend(
-            model_name=model_name,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-    elif backend_name == "openrouter":
-        return OpenRouterBackend(
-            model_name=model_name,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-    elif backend_name == "gemini" or backend_name == "google":
-        return GoogleGeminiBackend(
-            model_name=model_name,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            # **kwargs
-        )
-    else:
-        raise ValueError(f"Unknown backend: {backend_name}. Supported: openai, anthropic, openrouter, gemini")
+
+    if "/" not in model_name:
+        model_name = provider["prefix"] + model_name
+
+    return LiteLLMBackend(
+        model_name=model_name,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        api_key=kwargs.pop("api_key", None) or _first_env(provider["key"]),
+        base_url=kwargs.pop("base_url", None) or _first_env(provider["base"]),
+    )

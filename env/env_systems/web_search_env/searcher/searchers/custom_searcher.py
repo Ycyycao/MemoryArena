@@ -7,7 +7,6 @@ import openai
 import faiss
 
 from .base import BaseSearcher
-print("ENV OPENAI_API_KEY:", repr(os.getenv("OPENAI_API_KEY")))
 logger = logging.getLogger(__name__)
 class CustomSearcher(BaseSearcher):
     """

@@ -1,0 +1,36 @@
+{
+  "task_name": "search",
+  "agent": {
+    "model_name": "gpt-5-mini",
+    "embedding_model": "text-embedding-3-small",
+    "max_iterations": 35,
+    "provider": "openai"
+  },
+  "memory": {
+    "use_step_memory": false,
+    "memory_system_name": "simplemem",
+    "memory_url": "<MARENA_MEMORY_URL>",
+    "no_memory": false
+  },
+  "env": {
+    "env_server_url": "<MARENA_ENV_URL>",
+    "script_path": null,
+    "timeout": 3000,
+    "index_path": "<MARENA_BROWSECOMP_DATA>/embeddings/shard*.index",
+    "corpus_path": "<MARENA_BROWSECOMP_DATA>/data/corpus.jsonl",
+    "mcp_url": null,
+    "mcp_name": "retrieval-mcp-server"
+  },
+  "task_specific": {
+    "query_ids": [
+      "454"
+    ],
+    "store_eval_in_memory": false,
+    "data_dir": "<MARENA_BROWSECOMP_DATA>/data",
+    "qrel_evidence": "<MARENA_BROWSECOMP_DATA>/topics-qrels/qrel_evidence.txt",
+    "judge_model": "gpt-4.1"
+  },
+  "output": {
+    "output_dir": "<MARENA_RESULTS>/simplemem/search-simplemem-gpt5mini"
+  }
+}

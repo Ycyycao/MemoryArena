@@ -4,6 +4,32 @@ import json
 from pathlib import Path
 from typing import List
 
+def make_judge_client():
+    """env server 里判分用的 openai 客户端，带上这条 run 的归属头。
+
+    server 进程不装 `runctx.tag_openai_sdk()`（它在构造时取 REQUEST_ID，server 里
+    每个请求的值不同）。所以在这里、请求的上下文里构造时显式带上：中间件已经把
+    请求体里带 run-id 前缀的 task_id 放进了 REQUEST_ID。不带的话判分那一次调用在
+    网关记录里 request_id 为空，harvest 切不进这条 run（case1040 首次跑通时就是）。
+    """
+    import os
+
+    import openai
+
+    headers = None
+    try:
+        from harness import runctx
+        rid = runctx.current()
+        if rid:
+            headers = {runctx.HEADER: rid}
+    except ImportError:
+        pass
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    return openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"),
+                         base_url=base_url if base_url else None,
+                         default_headers=headers)
+
+
 class BrowseCompPlusEnvironment(BaseEnvironment):
     """BrowseComp-Plus environment for web browsing tasks."""
 
@@ -152,6 +178,12 @@ class BrowseCompPlusEnvironment(BaseEnvironment):
         if str(_root) not in sys.path:
             sys.path.insert(0, str(_root))
         from agent.search import run_query_with_agent_and_memory
+        from harness.trace import Recorder
+
+        # 轨迹在这里记，不在 run_search.py 里：subquery 的循环整个跑在 env server
+        # 进程内（一次 `run_sequential` 就是全流程），跑 run 的那个进程只看得到最后
+        # 一次合并查询的结果。事件跟着响应回去，由 run_search.py 落 trajectory.json。
+        recorder = Recorder()
 
         subqueries = self.config.get("subqueries") or []
         correct_answers = self.config.get("correct_answers") or []
@@ -170,10 +202,7 @@ class BrowseCompPlusEnvironment(BaseEnvironment):
 
         # Create judge client on server
         try:
-            import openai
-            api_key = os.environ.get("OPENAI_API_KEY")
-            base_url = os.environ.get("OPENAI_BASE_URL")
-            judge_client = openai.OpenAI(api_key=api_key, base_url=base_url if base_url else None)
+            judge_client = make_judge_client()
         except Exception:
             judge_client = None
 
@@ -208,6 +237,23 @@ class BrowseCompPlusEnvironment(BaseEnvironment):
                 step_memory=self.step_memory,
             )
             answer = result.get("answer", "")
+            # 记忆注入发生在 `run_query_with_agent_and_memory` 内部，拿不到调用前的
+            # 时刻，所以三个事件都在这一轮结束后按顺序补记。顺序和 travel / math 一致：
+            # wrap 开一轮，env.step 关一轮。
+            recorder.record("memory.wrap_user_prompt",
+                            question=subquery,
+                            wrapped_prompt=result.get("query_with_memory", subquery))
+            recorder.record("agent.act",
+                            subquery_idx=i + 1,
+                            query=subquery,
+                            answer=answer,
+                            tool_call_counts=result.get("tool_call_counts"),
+                            retrieved_docids=result.get("retrieved_docids", []))
+            # subquery 这一层没有判分（只有最后的合并查询过 judge），但每条 subquery
+            # 的标准答案是有的，一起记下来，事后能看出是哪一轮开始跑偏。
+            recorder.record("env.step",
+                            ground_truth=correct_answer,
+                            result={"answer": answer, "judged": False})
             if self.memory_client:
                 trace = result.get("trace", [])
                 trace_summary = ""
@@ -220,9 +266,10 @@ class BrowseCompPlusEnvironment(BaseEnvironment):
                 if trace_summary:
                     memory_entry += f"\n\nTrace: {trace_summary}"
                 self.memory_client.add(memory_entry)
+                recorder.record("memory.add", chunk=memory_entry)
 
         # Final combined query (use resolved _corpus so path is correct on server)
-        return BrowseCompPlusEnvironment.run_final_query(
+        final = BrowseCompPlusEnvironment.run_final_query(
             query_id=self.query_id,
             original_query=original_query,
             subqueries=subqueries,
@@ -243,7 +290,11 @@ class BrowseCompPlusEnvironment(BaseEnvironment):
             ground_truth_path=ground_truth_path,
             step_memory=self.step_memory,
             store_eval_in_memory=self.store_eval_in_memory,
+            recorder=recorder,
         )
+        # `events` 是新字段，老字段一个没动——run_search.py 之外的读法不受影响。
+        final["events"] = recorder.events
+        return final
 
     # --- Final Query Logic as a Standalone Function ---
     @staticmethod
@@ -268,6 +319,7 @@ class BrowseCompPlusEnvironment(BaseEnvironment):
         ground_truth_path: Optional[Path] = None,
         step_memory: bool = False,
         store_eval_in_memory: bool = False,
+        recorder=None,
     ):
         """
         Run the final query with full memory context, judge, and return result dict.
@@ -340,6 +392,18 @@ class BrowseCompPlusEnvironment(BaseEnvironment):
             with open(memory_context_file, 'w', encoding='utf-8') as f:
                 json.dump(memory_context_data, f, indent=2, ensure_ascii=False)
             print(f"[DEBUG] Saved memory context to: {memory_context_file}")
+        if recorder is not None:
+            # 最后这一轮：带全部记忆的合并查询，和上面每条 subquery 同一套事件。
+            recorder.record("memory.wrap_user_prompt",
+                            question=final_query,
+                            wrapped_prompt=final_query_with_memory)
+            recorder.record("agent.act",
+                            subquery_idx=None,
+                            query=final_query,
+                            answer=final_predicted_answer,
+                            tool_call_counts=final_tool_calls,
+                            retrieved_docids=final_retrieved_docids)
+
         # Calculate final recall
         final_recall = None
         if qrel_data and query_id in qrel_data:
@@ -362,6 +426,13 @@ class BrowseCompPlusEnvironment(BaseEnvironment):
         )
         is_final_correct = final_evaluation["correct"]
         print(f"Final Evaluation: {'CORRECT' if is_final_correct else 'INCORRECT'}")
+        if recorder is not None:
+            recorder.record("env.step",
+                            ground_truth=final_correct_answer,
+                            result={"answer": final_predicted_answer,
+                                    "judged": True,
+                                    "judgement": final_evaluation,
+                                    "recall": final_recall})
         return {
             "final_query": final_query,
             "query": final_query,

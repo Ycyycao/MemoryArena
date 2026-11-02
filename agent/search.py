@@ -27,6 +27,14 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import subprocess
+import sys
+
+from harness import runctx
+
+# 子进程的 cwd。上游注释说 index/corpus 的相对路径是按 env_systems 解析的，
+# 但从来没人设过 cwd——继承的是 env server 的 cwd（我们这里是 MemoryArena/），
+# 于是那些默认值全都指不着。显式钉在这里，让注释和事实一致。
+_ENV_SYSTEMS = Path(__file__).resolve().parent.parent / "env" / "env_systems"
 
 # Standalone function for running a query with agent and memory
 def run_query_with_agent_and_memory(
@@ -95,7 +103,7 @@ def run_query_with_agent_and_memory(
         
         if is_anthropic:
             cmd = [
-                "python", "search_agent/anthropic_client.py",
+                sys.executable, "search_agent/anthropic_client.py",
                 "--model", model,
                 "--query", query_file,  # Pass file path
                 "--output-dir", str(output_dir),
@@ -113,7 +121,7 @@ def run_query_with_agent_and_memory(
             )
             # LLM uses --model; searcher uses --openai-model (must be an embedding-capable model, e.g. text-embedding-3-small)
             cmd = [
-                "python", script_path,
+                sys.executable, script_path,
                 "--model", model,
                 "--query", query_file,  # Pass file path
                 "--output-dir", str(output_dir),
@@ -130,8 +138,12 @@ def run_query_with_agent_and_memory(
             if provider:
                 cmd.extend(["--provider", provider])
         
+        # 子进程的环境。`child_env` 做两件事：把 `OPENAI_BASE_URL` 从 env server
+        # 继承来的 /judge 入口换成 /agent（不然 agent 的对话和检索 embedding 全被
+        # 记成判分流量），以及把当前 `REQUEST_ID` 塞进环境变量，让子进程接得上
+        # 这条 run 的归属。
         # Set environment to use GPU
-        env = os.environ.copy()
+        env = runctx.child_env(os.environ.copy(), role="agent")
         if gpu is not None:
             env["CUDA_VISIBLE_DEVICES"] = str(gpu)
             print(f"[DEBUG] Setting CUDA_VISIBLE_DEVICES={gpu}")
@@ -157,7 +169,8 @@ def run_query_with_agent_and_memory(
         print(f"[DEBUG] Command: {' '.join(cmd)}")
         print(f"[DEBUG] Output dir: {output_dir}")
         print(f"[DEBUG] Query file: {query_file}")
-        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                                cwd=str(_ENV_SYSTEMS))
     finally:
         # Clean up temporary query file
         try:

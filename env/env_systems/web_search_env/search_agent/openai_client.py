@@ -320,9 +320,12 @@ def run_conversation_with_tools(
 
         if hasattr(response, "usage") and response.usage:
             usage = response.usage
-            cumulative_usage["input_tokens"] += getattr(usage, "prompt_tokens", 0)
-            cumulative_usage["output_tokens"] += getattr(usage, "completion_tokens", 0)
-            cumulative_usage["total_tokens"] += getattr(usage, "total_tokens", 0)
+            # 三个字段都要 `or 0`：中转站回的 usage 里字段在、值是 None 的情况真实
+            # 存在（getattr 的默认值只管字段缺失）。上游只给 total_tokens 补了，
+            # 前两行在 search-longcontext-case1040 的第一次 LLM 调用上就炸了。
+            cumulative_usage["input_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
+            cumulative_usage["output_tokens"] += getattr(usage, "completion_tokens", 0) or 0
+            cumulative_usage["total_tokens"] += getattr(usage, "total_tokens", 0) or 0
 
         # Extract tool calls (OpenAI native objects)
         tool_calls = message.tool_calls or []
@@ -598,6 +601,17 @@ def _process_tsv_dataset(
 
 
 def main():
+    # 这个脚本是 env server `subprocess.run` 出来的（agent/search.py），跑 run 的
+    # 进程设的 `REQUEST_ID` 跨不过进程边界。父进程把它放进了环境变量，这里接回来，
+    # 再给 openai SDK 建出来的客户端挂上 `X-Marena-Request` 头——不然这条 run 的
+    # agent 流量在网关记录里没有归属，`llm_journal.harvest` 按 run-id 切片时捡不到。
+    try:
+        from harness import runctx
+        runctx.adopt_from_env()
+        runctx.tag_openai_sdk()
+    except ImportError:
+        pass          # 脱离本仓库单跑这个脚本时没有 harness，照跑，只是没有归属
+
     parser = argparse.ArgumentParser(
         description="Call OpenAI Responses API with native function calling and local search."
     )

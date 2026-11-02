@@ -1,0 +1,40 @@
+# MemoryArena 的打包声明。
+#
+# 上游仓库本身没有 pyproject.toml，模块靠 cwd 相对导入（`from agent import ...`）。
+# 这份文件让它可以 editable 安装，import 不再依赖 cwd 或 sys.path 拼路径。
+#
+# 只声明包结构，不声明依赖：依赖统一由仓库根 pyproject.toml 按 memory system 分 extras 管。
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memoryarena"
+version = "0.0.0+6cd9de1"
+description = "MemoryArena fork (upstream github.com/ZexueHe/MemoryArena @ 6cd9de1)"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+marena-serve = "harness.serve:main"              # 起/停 server
+marena-travel-case = "run_travel:main"           # 跑 travel case
+marena-case = "run_math:main"                    # 跑 formal-reasoning case
+marena-search-case = "run_search:main"           # 跑 progressive-search case
+
+[tool.hatch.build.targets.wheel]
+only-include = [
+    "agent",
+    "env",
+    "harness",
+    "memory",
+    "dataset.py",
+    "run_math.py",
+    "run_search.py",
+    "run_shopping.py",
+    "run_travel.py",
+]
+# editable 安装时写一条 .pth 指向 MemoryArena/ 根目录，
+# 让 `import run_math` / `import agent` / `import memory.client` 全部可用
+# （memory/ 没有 __init__.py，只能靠这条路径生效）。
+dev-mode-dirs = ["."]

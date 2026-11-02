@@ -46,11 +46,54 @@ class ActRequest(BaseModel):
     memory_system_name: str
 
 # ---------- Memory/Agent implementations (unified) ----------
+
+def _mem0_factory():
+    """默认走本地（OSS）mem0；MARENA_MEM0_HOSTED=1 退回上游的托管实现。
+
+    托管版要 MEM0_API_KEY，而且把「用哪个模型抽事实」藏在服务端，对比时说不清差异
+    来自方法还是模型。
+    """
+    if os.getenv("MARENA_MEM0_HOSTED") == "1":
+        return Mem0MemorySystem()
+    from memory_systems.mem0_local import Mem0LocalMemorySystem
+    return Mem0LocalMemorySystem()
+
+
+def _mem0_graph_factory():
+    if os.getenv("MARENA_MEM0_HOSTED") == "1":
+        return Mem0MemorySystem(enable_graph=True)
+    raise NotImplementedError("mem0-g 需要外挂图数据库（Neo4j/Memgraph），本地实现没有")
+
+
+def _simplemem_factory():
+    """SimpleMem。不在上游 baseline 列表里，是我们加的。
+
+    对接层在 SimpleMem 自己的仓库（`simplemem/integrations/memoryarena.py`）——它做的
+    两件事（把 chunk 拆回带时间戳的对话轮、跳过 AnswerGenerator 只取检索结果）属于
+    SimpleMem 自己的适配面。这里延迟 import，因为 lancedb / sentence-transformers
+    只有跑 SimpleMem 时才需要装。
+    """
+    from memory.state import state_dir
+    from simplemem.integrations.memoryarena import MemoryArenaMemory
+
+    base = state_dir("simplemem")
+    # EmbeddingModel 读的是 settings.EMBEDDING_MODEL，只能从环境变量给。
+    # 指到本地权重目录，避免每次跑都去 HF 拉。
+    embedding = os.getenv("MARENA_SIMPLEMEM_EMBEDDING")
+    if embedding:
+        os.environ.setdefault("EMBEDDING_MODEL", embedding)
+    return MemoryArenaMemory(
+        db_path=str(base / "lancedb"),
+        model=os.getenv("MARENA_SIMPLEMEM_MODEL"),
+        trace_dir=str(base),
+    )
+
+
 MEMORY_FACTORIES: Dict[str, Callable[[], object]] = {
     "mirix": MirixMemorySystem,
     "long_context": LongContextMemorySystem,
-    "mem0": Mem0MemorySystem,
-    "mem0-g": lambda: Mem0MemorySystem(enable_graph=True),
+    "mem0": _mem0_factory,
+    "mem0-g": _mem0_graph_factory,
     "letta": LettaMemorySystem,
     "rag": RAGMemorySystem,
     "memorag": MemoRAGMemorySystem,
@@ -59,6 +102,7 @@ MEMORY_FACTORIES: Dict[str, Callable[[], object]] = {
     "lightmem": LightMemMemorySystem,
     "reasoningbank": ReasoningBankMemorySystem, # You must add user_id when initializing ReasoningBankMemorySystem
     "zep": ZepMemorySystem,
+    "simplemem": _simplemem_factory,
 }
 
 
@@ -99,6 +143,11 @@ def initialize(req: InitializeRequest):
         if factory is None:
             raise HTTPException(status_code=400, detail=f"Unsupported memory_system: {name}")
         memory_system = factory()
+    # 工厂是无参调用的，真正的 user_id 只有到这一刻才知道。实现如果需要它
+    # （mem0_local 的 store 目录、SimpleMem 的 trace 文件名），在这里交给它。
+    bind = getattr(memory_system, "bind_user_id", None)
+    if bind is not None:
+        bind(req.user_id)
     MEMORY_SYSTEMS[req.user_id] = MemorySystemEntry(name=name, system=memory_system)
     return {"status": "ok", "user_id": req.user_id, "memory_system_name": name}
 

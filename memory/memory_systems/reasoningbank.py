@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple, Optional
 # from google import genai
 # from google.genai.types import HttpOptions, GenerateContentConfig
 # from vertexai.language_models import TextEmbeddingInput, TextEmbeddingModel
-from openai import OpenAI
+import litellm
 from datetime import datetime
 import uuid
 import tiktoken
@@ -71,9 +71,9 @@ Your output must strictly follow the Markdown format shown below:
 class ReasoningBankMemorySystem:
     def __init__(
         self, 
-        storage_path: str = "./reasoningbank_data/",
-        embedding_path: str = "./reasoningbank_data/",
-        model_name: str = "gpt-4.1-mini",
+        storage_path: str = None,
+        embedding_path: str = None,
+        model_name: str = None,
         embedding_model: str = "text-embedding-3-small",
         embed_instruction: str= "Given the prior task queries, your task is to analyze a current query's intent and select relevant prior queries that could help complete it.",
         topk=5,
@@ -81,14 +81,22 @@ class ReasoningBankMemorySystem:
        
     ):
         self.tokenizer = tiktoken.encoding_for_model("gpt-4o-mini")
-        self.storage_path = storage_path
-        self.embedding_path = embedding_path
-        self.model_name = model_name
+        # 落盘默认走 memory.state（上游原值 "./reasoningbank_data/" 是 server 的 cwd，
+        # 会被 git clean 抹掉）。模型默认跟上游一致；MARENA_REASONINGBANK_MODEL 可以
+        # 把它拉齐到 agent 侧——两侧模型不同会在对比里多出一个变量。
+        from memory.state import state_dir
+        base = str(state_dir("reasoningbank")) + os.sep
+        self.storage_path = storage_path or base
+        self.embedding_path = embedding_path or base
+        self.model_name = model_name or os.getenv("MARENA_REASONINGBANK_MODEL") or "gpt-4.1-mini"
         self.embedding_model_name = embedding_model
         self.embed_instruction = embed_instruction
         self.topk=topk
         # initialize LLM client
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) #genai.Client(http_options=HttpOptions(api_version="v1"))
+        # Calls go through litellm, so the model name alone picks the provider
+        # (`gemini/...`, `anthropic/...`). Credentials are resolved once here.
+        self.api_key = os.getenv("OPENAI_API_KEY")
+        self.api_base = os.getenv("OPENAI_BASE_URL")
         
         self.user_id=user_id
         self.storage_path=os.path.join(self.storage_path , f"{self.user_id}_reasoning_bank.jsonl")
@@ -139,17 +147,15 @@ class ReasoningBankMemorySystem:
     
     def _get_openai_embedding(self, text: str, maxlen: int = 4096) -> torch.Tensor:
         """Obtain text embedding using Gemini Text Embedding Model."""
-        model = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        
-        resp = model.embeddings.create(
+        resp = litellm.embedding(
             model=self.embedding_model_name,
-            # input=[text[:maxlen]], #4096 letters -> 400 tokens
+            api_key=self.api_key,
+            api_base=self.api_base,
             input=[text[:maxlen]], #4096 letters -> 400 tokens
         )
-        # return torch.tensor([resp[0].values], dtype=torch.float32)
-        # print("Obtained OpenAI embedding")
-        # print("Shape of embedding:", torch.tensor([resp.data[0].embedding]).shape, len(resp.data[0].embedding))
-        return torch.tensor([resp.data[0].embedding], dtype=torch.float32)
+        # litellm returns data entries as plain dicts, not objects with .embedding
+        # the way the openai SDK does, so index rather than attribute-access.
+        return torch.tensor([resp.data[0]["embedding"]], dtype=torch.float32)
         
         
     def _get_qwen_embedding(self, query: str) -> Tuple[torch.Tensor, str, int]:
@@ -195,13 +201,14 @@ class ReasoningBankMemorySystem:
     def _llm_judge_status(self,  trajectory: str) -> bool:
         # print("judgeing status...")
         prompt = f"Task and Trajectory:\n{trajectory}\n\nDid the agent successfully complete the task? Answer with 'success' or 'fail' only."
-        response = self.client.chat.completions.create(
+        response = litellm.completion(
             model=self.model_name,
+            api_key=self.api_key,
+            api_base=self.api_base,
             messages=[
             {"role": "system", "content": "You are a helpful assistant that judges whether the agent successfully completed the task."},
             {"role": "user", "content": prompt}
             ],
-            
             temperature=0.0,
             max_completion_tokens=128,
         )
@@ -273,14 +280,16 @@ class ReasoningBankMemorySystem:
             List[str]: A list of memory item strings parsed from the LLM response.
         """
         # print("Generating Memory")
-        response = self.client.chat.completions.create(
+        response = litellm.completion(
             model=self.model_name,
+            api_key=self.api_key,
+            api_base=self.api_base,
             messages=[
             {"role": "system", "content": si.strip()},
             {"role": "user", "content": prompt}
             ],
             temperature=0.7,
-            max_completion_tokens=4096,            
+            max_completion_tokens=4096,
         )
         # print("Generated Memory")
         # Split by double newlines to separate individual "Memory Item" blocks

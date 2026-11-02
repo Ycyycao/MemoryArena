@@ -1,5 +1,14 @@
+"""group_travel_planner 数据的加载和行转换。
+
+本地副本优先，HuggingFace 兜底。上游原本只走 HF，但那在部分机器上拉不下来
+（`httpx.DecodingError: brotli`）；`$MEMORYARENA_DATA/group_travel_planner/` 下的
+jsonl 副本字段和 HF 版一致，走同一个 `_convert_row`，结构分毫不差。
+"""
+
+import json
+import os
 import re
-from datasets import load_dataset
+from pathlib import Path
 
 DATASET_NAME = "ZexueHe/memoryarena"
 DATASET_CONFIG = "group_travel_planner"
@@ -40,7 +49,37 @@ def _convert_row(row):
     }
 
 
-def load_travel_data():
-    """Load travel planner data from HuggingFace and convert to internal format."""
-    ds = load_dataset(DATASET_NAME, DATASET_CONFIG, split="test")
-    return [_convert_row(row) for row in ds]
+def _local_rows():
+    """本地副本里的行；没有 `$MEMORYARENA_DATA` 或目录为空就返回 None。"""
+    root = os.getenv("MEMORYARENA_DATA")
+    if not root:
+        return None
+    directory = Path(root).expanduser() / DATASET_CONFIG
+    if not directory.is_dir():
+        return None
+    rows = []
+    for path in sorted(directory.glob("*.jsonl")):
+        with open(path, encoding="utf-8") as handle:
+            rows.extend(json.loads(line) for line in handle if line.strip())
+    return rows or None
+
+
+def load_travel_data(only_group_id=None):
+    """本地副本优先，HF 兜底，返回内部格式的 group 列表。
+
+    `only_group_id` 不为 None 时只留那一组。`run_travel` 的主循环会遍历返回的整个
+    列表，所以这是把一次 run 缩到一条 case 的地方；env 要按 id 查全量，不传这个参数。
+    """
+    rows = _local_rows()
+    if rows is None:
+        from datasets import load_dataset
+        rows = load_dataset(DATASET_NAME, DATASET_CONFIG, split="test")
+
+    groups = [_convert_row(row) for row in rows]
+    if only_group_id is None:
+        return groups
+
+    picked = [g for g in groups if g["id"] == only_group_id]
+    if not picked:
+        raise SystemExit(f"{DATASET_CONFIG} 里没有 id={only_group_id}")
+    return picked

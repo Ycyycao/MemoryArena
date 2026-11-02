@@ -1,0 +1,32 @@
+{
+  "task_name": "travel_planner",
+
+  "agent": {
+    "model_name": "gpt-5-mini",
+    "backend": "openai",
+    "api_key": "",
+    "base_url": "<OPENAI_BASE_URL>"
+  },
+
+  "memory": {
+    "use_step_memory": false,
+    "memory_system_name": "simplemem",
+    "server_url": "<MARENA_MEMORY_URL>"
+  },
+
+  "env": {
+    "env_name": "travel_planner",
+    "env_server_url": "<MARENA_ENV_URL>",
+    "env_config": {
+      "judgement_mode": "hint"
+    }
+  },
+
+  "task_specific": {
+    "max_steps": 30
+  },
+
+  "output": {
+    "output_dir": "results/simplemem/travel-simplemem-gpt5mini"
+  }
+}

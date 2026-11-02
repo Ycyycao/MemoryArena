@@ -1,13 +1,22 @@
 """
-OpenAI Client - Implementation of BaseModelClient for OpenAI API
-Supports OpenAI's Tools API (function calling)
+OpenAI Client - Implementation of BaseModelClient for OpenAI-compatible APIs
+
+Calls go through litellm rather than the openai SDK, so the same client reaches
+OpenAI, Gemini, Anthropic, Bedrock, Vertex and the rest by model name alone
+(`gemini/gemini-2.5-flash`, `anthropic/claude-...`). litellm returns an
+OpenAI-shaped response, so everything downstream of the call is unchanged.
+
+The class name stays OpenAIClient because `travel_planner.py` selects it by
+`backend: openai`; it is no longer OpenAI-specific.
 """
 
 import os
 import json
+import random
 import time
 from typing import List, Dict, Optional
-from openai import OpenAI
+
+import litellm
 
 from .base_client import BaseModelClient, ModelResponse, ToolCall
 from ..cost_tracker import CostTracker
@@ -20,11 +29,47 @@ class OpenAIClient(BaseModelClient):
     
     def __init__(self, model_name: str = "gpt-4o-mini", api_key: str = None, base_url: str = None):
         super().__init__(model_name)
-        self.client = OpenAI(
-            api_key=api_key or os.environ.get("OPENAI_API_KEY"),
-            base_url=base_url or os.environ.get("OPENAI_API_BASE"),
-        )
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        # OPENAI_BASE_URL is the name the openai SDK itself uses; OPENAI_API_BASE
+        # is kept as a fallback because the original code read only that one.
+        self.api_base = (base_url
+                         or os.environ.get("OPENAI_BASE_URL")
+                         or os.environ.get("OPENAI_API_BASE"))
         self.cost_tracker = CostTracker(model_name)
+        self.retry_count = 0
+
+    # 一条 run 跑几十分钟，中间任何一个请求抛异常就掀掉整条。实测中转站在几条 run
+    # 并行时会返回 400 ContentPolicyViolationError，内容是一段旅行推理加一张航班表
+    # ——不是真的内容策略，是它自己的限速/过载误报（错误串尾巴带 ip:port）。所以
+    # 这里退避重试。
+    #
+    # 400 也重试：能区分"真违规"和"中转站误报"的信息我们手里没有，而真违规重试三次
+    # 也只是多花三次的钱、结果一样。重试次数会打到 stderr 并计数（retry_count），
+    # 跑完在 usage_stats.json 里看得到——**不要让重试把限速信号吃掉**，那个信号是
+    # 判断"要不要少跑几条并行"的唯一依据。
+    RETRY_ATTEMPTS = int(os.getenv("MARENA_LLM_RETRIES", "3"))
+    RETRY_BASE_SECONDS = float(os.getenv("MARENA_LLM_RETRY_BASE", "4"))
+
+    def _call(self, **kwargs):
+        """One place that talks to litellm, so credentials are not repeated."""
+        last = None
+        for attempt in range(1, self.RETRY_ATTEMPTS + 1):
+            try:
+                return litellm.completion(
+                    api_key=self.api_key, api_base=self.api_base, **kwargs)
+            except Exception as exc:
+                last = exc
+                self.retry_count += 1
+                if attempt == self.RETRY_ATTEMPTS:
+                    break
+                # 指数退避 + 抖动。限速要的是真等，几百毫秒没用；抖动是为了几条 run
+                # 并行时不要一起醒来再一起撞上去。
+                delay = self.RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+                delay *= 0.5 + random.random()
+                print(f"[retry] 第 {attempt}/{self.RETRY_ATTEMPTS} 次失败，{delay:.1f}s 后重试: "
+                      f"{type(exc).__name__}: {str(exc)[:200]}")
+                time.sleep(delay)
+        raise last
     
     def chat_with_tools(
         self,
@@ -39,7 +84,7 @@ class OpenAIClient(BaseModelClient):
         try:
             if self.model_name.startswith('gpt-5'):
                 # gpt-5 系列: 用 max_completion_tokens, 不传 temperature
-                response = self.client.chat.completions.create(
+                response = self._call(
                     model=self.model_name,
                     messages=messages,
                     tools=tools if tools else None,
@@ -48,7 +93,7 @@ class OpenAIClient(BaseModelClient):
                 )
             else:
                 # gpt-4 / Claude / 其他: 用 temperature + max_tokens
-                response = self.client.chat.completions.create(
+                response = self._call(
                     model=self.model_name,
                     messages=messages,
                     tools=tools if tools else None,
@@ -57,13 +102,17 @@ class OpenAIClient(BaseModelClient):
                     max_tokens=max_tokens
                 )
             
-            # Track usage
+            # Track usage. A third-party OpenAI-compatible endpoint can return
+            # null token counts (gpt-5* through a proxy does), and `int += None`
+            # raises TypeError, so a missing count counts as 0.
             if response.usage:
-                self.total_input_tokens += response.usage.prompt_tokens
-                self.total_output_tokens += response.usage.completion_tokens
+                prompt_tokens = response.usage.prompt_tokens or 0
+                completion_tokens = response.usage.completion_tokens or 0
+                self.total_input_tokens += prompt_tokens
+                self.total_output_tokens += completion_tokens
                 self.cost_tracker.add_usage(
-                    input_tokens=response.usage.prompt_tokens,
-                    output_tokens=response.usage.completion_tokens
+                    input_tokens=prompt_tokens,
+                    output_tokens=completion_tokens
                 )
             
             # Parse response
@@ -88,7 +137,7 @@ class OpenAIClient(BaseModelClient):
             )
             
         except Exception as e:
-            print(f"OpenAI API error: {e}")
+            print(f"LLM API error: {e}")
             raise
     
     def format_tool_result(self, tool_call_id: str, result: str, name: str = None) -> Dict:
@@ -129,7 +178,9 @@ class OpenAIClient(BaseModelClient):
         return {
             'total_input_tokens': cost_info['input_tokens'],
             'total_output_tokens': cost_info['output_tokens'],
-            'total_cost': cost_info['total_cost']
+            'total_cost': cost_info['total_cost'],
+            # 重试次数要露出来：它是"中转站在限速"的唯一可见证据
+            'llm_retries': self.retry_count,
         }
 
 
