@@ -28,6 +28,7 @@ AMemMemorySystem = _lazy("amem", "AMemMemorySystem")
 LightMemMemorySystem = _lazy("lightmem", "LightMemMemorySystem")
 ReasoningBankMemorySystem = _lazy("reasoningbank", "ReasoningBankMemorySystem")
 ZepMemorySystem = _lazy("zep", "ZepMemorySystem")
+MemframeMemorySystem = _lazy("memframe_adapter", "factory")
 
 load_dotenv()
 
@@ -146,6 +147,9 @@ def initialize(req: InitializeRequest):
     #     memory_system = GraphRAGMemorySystem(local_dir=os.getenv("GRAPHRAG_LOCAL_DIR"))
     elif name in {"reasoningbank"}:
         memory_system = ReasoningBankMemorySystem(user_id=req.user_id)
+    elif name.startswith("mf_"):
+        # DynMem 的 memframe 后端（mf_dynmem、mf_bm25、mf_simplemem ...），见 memory_systems/memframe_adapter.py
+        memory_system = MemframeMemorySystem(name)
     else:
         factory = MEMORY_FACTORIES.get(name)
         if factory is None:
