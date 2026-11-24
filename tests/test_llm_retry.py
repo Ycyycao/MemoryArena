@@ -101,3 +101,12 @@ def test_attempts_are_configurable(monkeypatch, slept):
         c._call(model="m", messages=[])
     assert len(calls) == 1               # 关掉重试就是只打一次
     assert slept == []
+
+
+def test_client_waits_for_a_full_length_reply_and_retries_only_in_call(client, monkeypatch):
+    # A 32768-token thought at ~35 tokens/s per stream takes about 15 minutes; the SDK default (600 s, 2 retries) cut
+    # it off and retried it on top of _call's own retries until the group failed.
+    assert client.client.timeout == 3600
+    assert client.client.max_retries == 0
+    monkeypatch.setenv("MARENA_LLM_TIMEOUT", "120")
+    assert OpenAIClient(model_name="gpt-5-mini").client.timeout == 120

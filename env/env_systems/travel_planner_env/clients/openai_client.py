@@ -23,11 +23,17 @@ class OpenAIClient(BaseModelClient):
         super().__init__(model_name)
         # OPENAI_BASE_URL is the name the openai SDK itself uses; OPENAI_API_BASE
         # is kept as a fallback because the original code read only that one.
+        # A thought that runs to max_tokens (32768) takes about 15 minutes at the ~35 tokens/s per stream of a shared
+        # local server under load: the SDK's 600 s default timed it out, and the retries timed out again, until the
+        # whole group failed. Wait long enough for it to end (it is then discarded and asked again, see
+        # TravelPlannerAgent._unusable_reply); _call below is the only retry layer.
         self.client = OpenAI(
             api_key=api_key or os.environ.get("OPENAI_API_KEY"),
             base_url=(base_url
                       or os.environ.get("OPENAI_BASE_URL")
                       or os.environ.get("OPENAI_API_BASE")),
+            timeout=float(os.getenv("MARENA_LLM_TIMEOUT", "3600")),
+            max_retries=0,
         )
         self.cost_tracker = CostTracker(model_name)
         self.retry_count = 0
