@@ -52,5 +52,8 @@ def scratchpad_to_json(result: Any) -> List[Dict[str, Any]]:
         step_memory = getattr(step, "step_memory", None)
         if step_memory:
             entry["step_memory"] = step_memory
+        discarded = getattr(step, "discarded", None)
+        if discarded:
+            entry["discarded"] = discarded
         steps.append(entry)
     return steps

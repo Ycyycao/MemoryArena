@@ -456,13 +456,11 @@ def test_react_prompt_no_longer_forbids_thinking_in_the_final_message():
     assert "beginning of its own line" in REACT_AGENT_SYSTEM_PROMPT
 
 
-def test_toolcall_keeps_final_output_none_when_the_model_says_nothing(build):
-    """默认钩子必须逐字保住原来的取值，包括 None 和 "" 的区别。
-
-    原代码是 `step.final_output = response.content` / `final_plan = content or ""`。
-    加钩子的时候差点把 None 变成 ""，那会改掉落盘的 scratchpad。
-    """
+def test_toolcall_discards_a_reply_that_says_nothing(build):
+    """A reply with no text and no tool call is not the final plan: it is discarded and asked again
+    (tests/test_discarded_reply.py). The discarded step keeps final_output None, as upstream recorded it."""
     agent, _ = build(TravelPlannerAgent, [(None, [])])
     result = agent.run_single_person(query="q", name="Eric", round_idx=1)
-    assert result.scratchpad[-1].final_output is None
-    assert result.final_plan == ""
+    assert result.scratchpad[0].discarded == "empty"
+    assert result.scratchpad[0].final_output is None
+    assert result.final_plan == PLAN

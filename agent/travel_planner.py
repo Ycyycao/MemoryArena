@@ -30,6 +30,10 @@ class AgentStep:
     # 看不到它注入过什么。挂在步上而不是发一条 memory.wrap_user_prompt 事件：
     # trace_prep 的一轮是按那个事件开的，多发一次就多算一轮。
     step_memory: Optional[str] = None
+    # Set when the reply was thrown away instead of taken as the final plan: "truncated" (finish_reason length,
+    # e.g. thinking that ran into the output cap) or "empty" (no text and no tool call). The step still counts
+    # toward max_steps, the request is sent again unchanged, and the step stays out of memory entries.
+    discarded: Optional[str] = None
 
 
 @dataclass
@@ -67,6 +71,7 @@ class TravelPlannerAgent(BaseAgent):
         self.client = client or self._create_client(model_name)
         self.executor = executor or ToolExecutor(db_path=db_path)
         self.max_steps = max_steps
+        self.discarded_replies = 0
 
         self.system_prompt = system_prompt or AGENT_SYSTEM_PROMPT
         self.base_messages: List[Dict] = [{"role": "system", "content": self.system_prompt}]
@@ -280,6 +285,13 @@ class TravelPlannerAgent(BaseAgent):
                         "content": f"[Step Memory] Updated context from memory:\n\n{step_memory}",
                     })
 
+            elif self._unusable_reply(response):
+                # Upstream takes any reply without a tool call as the final plan, so a reply cut off by the output
+                # cap (or an empty one) became an empty plan. Throw it away and ask again; it costs a step.
+                step.discarded = self._unusable_reply(response)
+                self.discarded_replies += 1
+                print(f"[agent] step {step_idx}: {step.discarded} reply discarded, asking again")
+
             else:
                 preamble, plan = self._split_final_message(response.content, name)
                 if preamble is not None:
@@ -333,6 +345,21 @@ class TravelPlannerAgent(BaseAgent):
             chunk["judgement"] = judgement
         return json.dumps(chunk, ensure_ascii=False)
 
+    @staticmethod
+    def _unusable_reply(response) -> Optional[str]:
+        """Why a reply without tool calls cannot be the final plan, or None when it can."""
+        raw = getattr(response, "raw_response", None)
+        try:
+            choice = raw["choices"][0] if isinstance(raw, dict) else raw.choices[0]
+            finish = choice["finish_reason"] if isinstance(choice, dict) else choice.finish_reason
+        except (KeyError, IndexError, TypeError, AttributeError):
+            finish = None
+        if finish == "length":
+            return "truncated"
+        if not (response.content or "").strip():
+            return "empty"
+        return None
+
     def _scratchpad_to_dict(self, scratchpad: List[AgentStep], model_type: str = None) -> list:
         if model_type is None:
             model_type = "openai"
@@ -343,6 +370,8 @@ class TravelPlannerAgent(BaseAgent):
 
         result = []
         for step in scratchpad:
+            if step.discarded:
+                continue
             step_dict = {
                 'step_idx': step.step_idx,
                 'thought': step.thought,
@@ -373,4 +402,4 @@ class TravelPlannerAgent(BaseAgent):
         self._pending_memory_system = None
 
     def get_usage_stats(self) -> Dict:
-        return self.client.get_usage_stats()
+        return {**self.client.get_usage_stats(), "discarded_replies": self.discarded_replies}
