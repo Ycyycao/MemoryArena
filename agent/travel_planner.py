@@ -57,10 +57,15 @@ class TravelPlannerAgent(BaseAgent):
         max_steps: int = 30,
         db_path: str = None,
         system_prompt: str = None,
+        client: Optional[BaseModelClient] = None,
+        executor: Optional[ToolExecutor] = None,
     ):
         super().__init__(model_name, temperature)
-        self.client = self._create_client(model_name)
-        self.executor = ToolExecutor(db_path=db_path)
+        # client / executor 可以从外面给：一个进程里并行跑几组时，几个 agent 共用一份
+        # ToolExecutor（航班表三百多 MB，每个 agent 各读一份内存吃不消）；client 让调用方
+        # 定 base_url 和请求参数，不靠进程级的环境变量。
+        self.client = client or self._create_client(model_name)
+        self.executor = executor or ToolExecutor(db_path=db_path)
         self.max_steps = max_steps
 
         self.system_prompt = system_prompt or AGENT_SYSTEM_PROMPT

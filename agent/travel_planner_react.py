@@ -44,6 +44,8 @@ class ReActTravelPlannerAgent(TravelPlannerAgent):
         system_prompt: str = None,
         require_thought: bool = True,
         max_thought_retries: int = 1,
+        client=None,
+        executor=None,
     ):
         super().__init__(
             model_name=model_name,
@@ -51,6 +53,8 @@ class ReActTravelPlannerAgent(TravelPlannerAgent):
             max_steps=max_steps,
             db_path=db_path,
             system_prompt=system_prompt or REACT_AGENT_SYSTEM_PROMPT,
+            client=client,
+            executor=executor,
         )
         self.require_thought = require_thought
         self.max_thought_retries = max_thought_retries

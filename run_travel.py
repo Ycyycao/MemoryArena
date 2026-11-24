@@ -40,6 +40,19 @@ from harness import llm_journal, runctx
 from harness.trace import Recorder, scratchpad_to_json
 
 
+MEMORY_SYSTEMS = ["none", "long_context", "mirix", "letta", "mem0", "mem0-g",
+                  "rag", "bm25", "text-embedding-3-small", "cognee", "memorag",
+                  "graphrag", "lightmem", "amem", "reasoningbank", "zep",
+                  "simplemem"]
+
+
+def memory_system_arg(name: str) -> str:
+    """上游的名字，或者 `mf_<后端>`：memory server 用 memframe_adapter 包一个 DynMem 的 memframe 后端。"""
+    if name in MEMORY_SYSTEMS or (name.startswith("mf_") and len(name) > 3):
+        return name
+    raise argparse.ArgumentTypeError(f"unknown memory system {name!r}")
+
+
 def get_memory_system(memory_system_name: str, user_id: str, server_url: str = "http://0.0.0.0:8000"):
     if memory_system_name == "none":
         return None
@@ -145,11 +158,8 @@ def main():
     parser.add_argument("--judgement_mode", type=str, default="hint",
                         choices=["answer", "hint", "none"])
     parser.add_argument("--max_steps", type=int, default=30)
-    parser.add_argument("--memory_system", type=str, default="none",
-                        choices=["none", "long_context", "mirix", "letta", "mem0", "mem0-g",
-                                 "rag", "bm25", "text-embedding-3-small", "cognee", "memorag",
-                                 "graphrag", "lightmem", "amem", "reasoningbank", "zep",
-                                 "simplemem"])
+    parser.add_argument("--memory_system", type=memory_system_arg, default="none",
+                        help="、".join(MEMORY_SYSTEMS) + "，或 mf_<后端>（DynMem 的 memframe 后端）")
     parser.add_argument("--server_url", type=str, default="http://0.0.0.0:8000")
     parser.add_argument("--env_server_url", type=str, default="http://0.0.0.0:8001")
     # 跑单条 case 用的
@@ -244,6 +254,273 @@ def main():
         print(f"\ntrajectory.json  {trajectory}")
 
 
+def run_group(args, agent, env_client, recorder, data_idx, memory_system, max_people=0):
+    """跑一组（一个 base person 加依次加入的几个人），返回要存成 generated_plan_<id>.json 的 dict。
+
+    env_client 和 memory_system 都是鸭子类型：HTTP 的 EnvironmentClient / MemoryClient，或者同一进程里的
+    对象（DynMem 的 core/run_official.py 用 env.local_client.LocalEnvironmentClient 和一个有 add /
+    wrap_user_prompt 的 memory system），流程一字不差。memory_system 为 None 是无 memory 的官方路径。
+    """
+    # --- Reset env for this group ---
+    obs = env_client.reset(seed=data_idx)
+    if max_people:
+        obs["questions"] = obs.get("questions", [])[:max_people]
+        obs["answers"] = obs.get("answers", [])[:max_people]
+    recorder.record(
+        "env.reset",
+        group_id=obs.get("group_id"),
+        base_person=obs.get("base_person"),
+        num_people=len(obs.get("questions", [])),
+    )
+
+    multi_queries = obs["questions"]
+    ground_truth_list = obs.get("answers", [])
+
+    gt_by_round = {}
+    for gt in ground_truth_list:
+        gt_by_round[gt['round_idx']] = gt
+
+    all_round_results = []
+    all_results = []
+    all_scratchpads = []
+    total_rounds = len(multi_queries)
+    accumulated_plan_text = ""
+    round_judgements = {}
+
+    agent.reset()
+
+    # --- Handle base_person ---
+    base_person = obs.get("base_person")
+    if base_person:
+        base_name = base_person['name']
+        base_query = base_person['query']
+        base_plan = format_person_plan(base_name, base_person['daily_plans'])
+        accumulated_plan_text = base_plan
+        print(f"[Data {data_idx}] Base person set: {base_name}")
+
+        if memory_system:
+            base_chunk = json.dumps({
+                "name": base_name,
+                "query": base_query,
+                "is_base_person": True,
+                "final_plan": base_plan,
+            }, ensure_ascii=False)
+            memory_system.add(base_chunk)
+            recorder.record("memory.add", chunk=base_chunk)
+
+            if args.memory_system in ['mem0', 'mem0-g']:
+                print("[Memory] Waiting 10s for Mem0 indexing...")
+                time.sleep(50)
+            print(f"[Memory] Added base person to memory ({len(base_chunk)} chars)")
+            print(f"[Memory] Base person query: {base_query[:100]}...")
+            print(f"[Memory] Base chunk content:\n{base_chunk[:1000]}{'...' if len(base_chunk) > 1000 else ''}")
+        else:
+            agent.set_base_person(base_name, base_query, base_plan)
+
+    subquery_times = {}
+    consecutive_round_failures = 0
+
+    # --- Loop over persons ---
+    for round_item in multi_queries:
+        subquery_start = time.time()
+
+        single_query = round_item['query']
+        round_idx = round_item['round_idx']
+        name = round_item.get('name', f'User{round_idx}')
+
+        print(f"\n{'=' * 50}")
+        print(f"[Data {data_idx}, Round {round_idx}, Name: {name}] Starting Agent...")
+        print(f"{'=' * 50}")
+        print(f"Query: {single_query[:200]}...")
+
+        # 一条 run 跑几十分钟，中间一个请求抛异常就把整条掀了——react2 那次就是
+        # 第 6 轮一个 400 掀掉了前 5 轮之外的全部。单轮失败记一条 round.error
+        # 接着跑下一个人。
+        #
+        # 不发假的 agent.act / env.step：那两个事件在下游是配对读的（见
+        # harness/trace.py 和 tests/test_trajectory_schema.py），伪造一条等于
+        # 往结果里写一轮不存在的判分。失败的轮就是没有产出，如实记成新事件。
+        try:
+            # 1. Memory wrap
+            memory_context = None
+            if memory_system:
+                wrapped_prompt = memory_system.wrap_user_prompt(single_query)
+                recorder.record("memory.wrap_user_prompt",
+                                question=single_query, wrapped_prompt=wrapped_prompt)
+                memory_context = wrapped_prompt.split("</memory_context>")[0] + "</memory_context>"
+                memory_context = memory_context.strip()
+
+                print(f"\n[Memory] === Retrieved Context for {name} ===")
+                print(f"[Memory] Context length: {len(memory_context)} chars")
+                print(f"[Memory] Content:\n{memory_context[:2000]}{'...' if len(memory_context) > 2000 else ''}")
+                print(f"[Memory] === End Retrieved Context ===")
+
+            # 2. Agent act (full ReAct loop inside)
+            use_step_memory = getattr(args, 'use_step_memory', False)
+            agent.prepare_for_person(
+                name=name,
+                round_idx=round_idx,
+                include_previous_plans=(memory_system is None),
+                memory_context=memory_context,
+                memory_system=memory_system if use_step_memory else None,
+            )
+            action = agent.act(single_query)
+            agent_result = agent.last_result
+            recorder.record(
+                "agent.act",
+                person=name,
+                query=single_query,
+                final_plan=action,
+                total_steps=getattr(agent_result, "total_steps", None),
+                success=getattr(agent_result, "success", None),
+                error_message=getattr(agent_result, "error_message", None),
+                scratchpad=scratchpad_to_json(agent_result),
+            )
+
+            accumulated_plan_text += f"\n\n{action}" if accumulated_plan_text else action
+
+            print(f"\n{'=' * 50}")
+            print(f"[Data {data_idx}, Round {round_idx}, Name: {name}] RESULT:")
+            print(f"{'=' * 50}\n")
+            print(f"{action[:1000]}..." if len(action) > 1000 else action)
+            print(f"\nSteps: {agent_result.total_steps}, Success: {agent_result.success}")
+
+            # 3. Env step (evaluate via env_server)
+            gt = gt_by_round.get(round_idx)
+            ground_truth = None
+            if gt and 'daily_plans' in gt:
+                ground_truth = {
+                    "name": name,
+                    "daily_plans": gt['daily_plans'],
+                    "judgement_mode": args.judgement_mode,
+                }
+                result = env_client.step(
+                    action, ground_truth=ground_truth, need_judge=True,
+                )
+            else:
+                result = env_client.step(action)
+
+            recorder.record("env.step", ground_truth=ground_truth, result=result)
+
+            observation = result["observation"]
+            reward = result["reward"]
+            info = result.get("info", {})
+
+            round_result = {
+                'round': round_idx,
+                'name': name,
+                'query': single_query,
+                'result': action,
+            }
+            all_round_results.append(round_result)
+
+            scratchpad_dict = agent.get_scratchpad_dict()
+            all_scratchpads.append({
+                'round': round_idx,
+                'name': name,
+                'scratchpad': scratchpad_dict,
+                'total_steps': agent_result.total_steps,
+                'success': agent_result.success,
+                'error_message': agent_result.error_message,
+            })
+
+            parsed_this_round = parse_all_plans(accumulated_plan_text, multi_queries[:round_idx])
+            all_results.append(parsed_this_round)
+
+            judgement = info.get("judgement")
+            if judgement:
+                round_judgements[round_idx] = judgement
+
+            # 4. Build memory entry and add to memory
+            if memory_system:
+                obs_with_judgement = {**(observation or {}), "judgement": judgement}
+                memory_entry = agent.build_memory_entry(
+                    task=single_query,
+                    action=action,
+                    observation=obs_with_judgement,
+                    reward=reward,
+                )
+                memory_system.add(memory_entry)
+                recorder.record("memory.add", chunk=memory_entry)
+
+                if args.memory_system in ['mem0', 'mem0-g']:
+                    print(f"[Memory] Waiting for Mem0 indexing...")
+                    time.sleep(60)
+                print(f"\n[Memory] === Added Trace for {name} ===")
+                print(f"[Memory] Chunk size: {len(memory_entry)} chars")
+                print(f"[Memory] Scratchpad steps: {len(scratchpad_dict)}")
+                print(f"[Memory] Has judgement: {judgement is not None}")
+                if judgement:
+                    judge_preview = judgement[:500] + "..." if len(judgement) > 500 else judgement
+                    print(f"[Memory] Judgement:\n{judge_preview}")
+                print(f"[Memory] Chunk content:\n{memory_entry[:2000]}{'...' if len(memory_entry) > 2000 else ''}")
+                print(f"[Memory] === End Trace ===\n")
+
+        except Exception as exc:
+            consecutive_round_failures += 1
+            detail = f"{type(exc).__name__}: {exc}"
+            recorder.record(
+                "round.error",
+                round_idx=round_idx,
+                person=name,
+                error=detail[:2000],
+            )
+            print(f"\n[round.error] 第 {round_idx} 轮（{name}）失败，跳过：{detail[:300]}")
+            if consecutive_round_failures >= MAX_CONSECUTIVE_ROUND_FAILURES:
+                # 连着挂说明不是偶发，是 provider 或 server 塌了。继续跑只是
+                # 烧钱，把异常放出去让 finally 落盘已经跑完的部分。
+                print(f"[round.error] 连续 {consecutive_round_failures} 轮失败，中止这一组")
+                raise
+            continue
+        consecutive_round_failures = 0
+
+        # Non-memory: feed cumulative judge feedback to agent
+        if round_idx < total_rounds and memory_system is None:
+            all_feedback = [
+                round_judgements[r]
+                for r in sorted(round_judgements.keys())
+                if r <= round_idx
+            ]
+            if all_feedback:
+                combined_judge = "\n\n".join(all_feedback)
+                agent.add_judge_feedback(combined_judge)
+                print(f"[Added judge ({args.judgement_mode}) for all travelers up to round {round_idx}]")
+
+        subquery_time = time.time() - subquery_start
+        subquery_times[round_idx] = subquery_time
+        print(f"\n[Timing] Data {data_idx}, Round {round_idx}, {name}: {subquery_time:.2f}s")
+
+    # --- Save output ---
+
+    final_parsed_results = all_results[-1] if all_results else []
+
+    for person in final_parsed_results:
+        person_idx = person.get('person_idx')
+        if person_idx is not None and person_idx in subquery_times:
+            person['subquery_time'] = round(subquery_times[person_idx], 2)
+
+    result_to_save = {
+        'metadata': {
+            'model_name': args.model_name,
+            'judgement_mode': args.judgement_mode,
+            'memory_system': args.memory_system,
+            'mode': 'agent',
+            'max_steps': args.max_steps,
+        },
+        f'{args.model_name}_sole-planning_results': final_parsed_results,
+        'all_results': all_results,
+        'scratchpads': all_scratchpads,
+    }
+
+    print(f"\n{'=' * 60}")
+    print(f"[Data {data_idx}] GROUP SUMMARY")
+    print(f"{'=' * 60}")
+    print(f"Total persons: {total_rounds}")
+    print(f"Memory system: {args.memory_system}")
+    print(f"{'=' * 60}\n")
+    return result_to_save
+
+
 def _run_all(args, recorder, run_id, only_group_id, max_people):
     """跑 config 指定的 group（`only_group_id` 不为 None 时只跑那一组）。"""
     log_dir = getattr(args, 'log_dir', '') or ''
@@ -306,18 +583,6 @@ def _run_all(args, recorder, run_id, only_group_id, max_people):
             print(f"[Data {data_idx}] Output file already exists, skipping: {output_file}")
             continue
 
-        # --- Reset env for this group ---
-        obs = env_client.reset(seed=data_idx)
-        if max_people:
-            obs["questions"] = obs.get("questions", [])[:max_people]
-            obs["answers"] = obs.get("answers", [])[:max_people]
-        recorder.record(
-            "env.reset",
-            group_id=obs.get("group_id"),
-            base_person=obs.get("base_person"),
-            num_people=len(obs.get("questions", [])),
-        )
-
         # --- Initialize memory system for this group ---
         # user_id 加 run-id 前缀：上游的 id 只含 data_idx/model/memory，跨 run 是同一个，
         # 有状态的实现（ReasoningBank 落 jsonl、mem0 落向量库）会把上一次 run 的记忆读
@@ -328,252 +593,8 @@ def _run_all(args, recorder, run_id, only_group_id, max_people):
         if memory_system:
             print(f"\n[Memory] Initialized {args.memory_system} for user_id: {memory_user_id}")
 
-        multi_queries = obs["questions"]
-        ground_truth_list = obs.get("answers", [])
-
-        gt_by_round = {}
-        for gt in ground_truth_list:
-            gt_by_round[gt['round_idx']] = gt
-
-        all_round_results = []
-        all_results = []
-        all_scratchpads = []
-        total_rounds = len(multi_queries)
-        accumulated_plan_text = ""
-        round_judgements = {}
-
-        agent.reset()
-
-        # --- Handle base_person ---
-        base_person = obs.get("base_person")
-        if base_person:
-            base_name = base_person['name']
-            base_query = base_person['query']
-            base_plan = format_person_plan(base_name, base_person['daily_plans'])
-            accumulated_plan_text = base_plan
-            print(f"[Data {data_idx}] Base person set: {base_name}")
-
-            if memory_system:
-                base_chunk = json.dumps({
-                    "name": base_name,
-                    "query": base_query,
-                    "is_base_person": True,
-                    "final_plan": base_plan,
-                }, ensure_ascii=False)
-                memory_system.add(base_chunk)
-                recorder.record("memory.add", chunk=base_chunk)
-
-                if args.memory_system in ['mem0', 'mem0-g']:
-                    print("[Memory] Waiting 10s for Mem0 indexing...")
-                    time.sleep(50)
-                print(f"[Memory] Added base person to memory ({len(base_chunk)} chars)")
-                print(f"[Memory] Base person query: {base_query[:100]}...")
-                print(f"[Memory] Base chunk content:\n{base_chunk[:1000]}{'...' if len(base_chunk) > 1000 else ''}")
-            else:
-                agent.set_base_person(base_name, base_query, base_plan)
-
-        subquery_times = {}
-        consecutive_round_failures = 0
-
-        # --- Loop over persons ---
-        for round_item in multi_queries:
-            subquery_start = time.time()
-
-            single_query = round_item['query']
-            round_idx = round_item['round_idx']
-            name = round_item.get('name', f'User{round_idx}')
-
-            print(f"\n{'=' * 50}")
-            print(f"[Data {data_idx}, Round {round_idx}, Name: {name}] Starting Agent...")
-            print(f"{'=' * 50}")
-            print(f"Query: {single_query[:200]}...")
-
-            # 一条 run 跑几十分钟，中间一个请求抛异常就把整条掀了——react2 那次就是
-            # 第 6 轮一个 400 掀掉了前 5 轮之外的全部。单轮失败记一条 round.error
-            # 接着跑下一个人。
-            #
-            # 不发假的 agent.act / env.step：那两个事件在下游是配对读的（见
-            # harness/trace.py 和 tests/test_trajectory_schema.py），伪造一条等于
-            # 往结果里写一轮不存在的判分。失败的轮就是没有产出，如实记成新事件。
-            try:
-                # 1. Memory wrap
-                memory_context = None
-                if memory_system:
-                    wrapped_prompt = memory_system.wrap_user_prompt(single_query)
-                    recorder.record("memory.wrap_user_prompt",
-                                    question=single_query, wrapped_prompt=wrapped_prompt)
-                    memory_context = wrapped_prompt.split("</memory_context>")[0] + "</memory_context>"
-                    memory_context = memory_context.strip()
-
-                    print(f"\n[Memory] === Retrieved Context for {name} ===")
-                    print(f"[Memory] Context length: {len(memory_context)} chars")
-                    print(f"[Memory] Content:\n{memory_context[:2000]}{'...' if len(memory_context) > 2000 else ''}")
-                    print(f"[Memory] === End Retrieved Context ===")
-
-                # 2. Agent act (full ReAct loop inside)
-                use_step_memory = getattr(args, 'use_step_memory', False)
-                agent.prepare_for_person(
-                    name=name,
-                    round_idx=round_idx,
-                    include_previous_plans=(memory_system is None),
-                    memory_context=memory_context,
-                    memory_system=memory_system if use_step_memory else None,
-                )
-                action = agent.act(single_query)
-                agent_result = agent.last_result
-                recorder.record(
-                    "agent.act",
-                    person=name,
-                    query=single_query,
-                    final_plan=action,
-                    total_steps=getattr(agent_result, "total_steps", None),
-                    success=getattr(agent_result, "success", None),
-                    error_message=getattr(agent_result, "error_message", None),
-                    scratchpad=scratchpad_to_json(agent_result),
-                )
-
-                accumulated_plan_text += f"\n\n{action}" if accumulated_plan_text else action
-
-                print(f"\n{'=' * 50}")
-                print(f"[Data {data_idx}, Round {round_idx}, Name: {name}] RESULT:")
-                print(f"{'=' * 50}\n")
-                print(f"{action[:1000]}..." if len(action) > 1000 else action)
-                print(f"\nSteps: {agent_result.total_steps}, Success: {agent_result.success}")
-
-                # 3. Env step (evaluate via env_server)
-                gt = gt_by_round.get(round_idx)
-                ground_truth = None
-                if gt and 'daily_plans' in gt:
-                    ground_truth = {
-                        "name": name,
-                        "daily_plans": gt['daily_plans'],
-                        "judgement_mode": args.judgement_mode,
-                    }
-                    result = env_client.step(
-                        action, ground_truth=ground_truth, need_judge=True,
-                    )
-                else:
-                    result = env_client.step(action)
-
-                recorder.record("env.step", ground_truth=ground_truth, result=result)
-
-                observation = result["observation"]
-                reward = result["reward"]
-                info = result.get("info", {})
-
-                round_result = {
-                    'round': round_idx,
-                    'name': name,
-                    'query': single_query,
-                    'result': action,
-                }
-                all_round_results.append(round_result)
-
-                scratchpad_dict = agent.get_scratchpad_dict()
-                all_scratchpads.append({
-                    'round': round_idx,
-                    'name': name,
-                    'scratchpad': scratchpad_dict,
-                    'total_steps': agent_result.total_steps,
-                    'success': agent_result.success,
-                    'error_message': agent_result.error_message,
-                })
-
-                parsed_this_round = parse_all_plans(accumulated_plan_text, multi_queries[:round_idx])
-                all_results.append(parsed_this_round)
-
-                judgement = info.get("judgement")
-                if judgement:
-                    round_judgements[round_idx] = judgement
-
-                # 4. Build memory entry and add to memory
-                if memory_system:
-                    obs_with_judgement = {**(observation or {}), "judgement": judgement}
-                    memory_entry = agent.build_memory_entry(
-                        task=single_query,
-                        action=action,
-                        observation=obs_with_judgement,
-                        reward=reward,
-                    )
-                    memory_system.add(memory_entry)
-                    recorder.record("memory.add", chunk=memory_entry)
-
-                    if args.memory_system in ['mem0', 'mem0-g']:
-                        print(f"[Memory] Waiting for Mem0 indexing...")
-                        time.sleep(60)
-                    print(f"\n[Memory] === Added Trace for {name} ===")
-                    print(f"[Memory] Chunk size: {len(memory_entry)} chars")
-                    print(f"[Memory] Scratchpad steps: {len(scratchpad_dict)}")
-                    print(f"[Memory] Has judgement: {judgement is not None}")
-                    if judgement:
-                        judge_preview = judgement[:500] + "..." if len(judgement) > 500 else judgement
-                        print(f"[Memory] Judgement:\n{judge_preview}")
-                    print(f"[Memory] Chunk content:\n{memory_entry[:2000]}{'...' if len(memory_entry) > 2000 else ''}")
-                    print(f"[Memory] === End Trace ===\n")
-
-            except Exception as exc:
-                consecutive_round_failures += 1
-                detail = f"{type(exc).__name__}: {exc}"
-                recorder.record(
-                    "round.error",
-                    round_idx=round_idx,
-                    person=name,
-                    error=detail[:2000],
-                )
-                print(f"\n[round.error] 第 {round_idx} 轮（{name}）失败，跳过：{detail[:300]}")
-                if consecutive_round_failures >= MAX_CONSECUTIVE_ROUND_FAILURES:
-                    # 连着挂说明不是偶发，是 provider 或 server 塌了。继续跑只是
-                    # 烧钱，把异常放出去让 finally 落盘已经跑完的部分。
-                    print(f"[round.error] 连续 {consecutive_round_failures} 轮失败，中止这一组")
-                    raise
-                continue
-            consecutive_round_failures = 0
-
-            # Non-memory: feed cumulative judge feedback to agent
-            if round_idx < total_rounds and memory_system is None:
-                all_feedback = [
-                    round_judgements[r]
-                    for r in sorted(round_judgements.keys())
-                    if r <= round_idx
-                ]
-                if all_feedback:
-                    combined_judge = "\n\n".join(all_feedback)
-                    agent.add_judge_feedback(combined_judge)
-                    print(f"[Added judge ({args.judgement_mode}) for all travelers up to round {round_idx}]")
-
-            subquery_time = time.time() - subquery_start
-            subquery_times[round_idx] = subquery_time
-            print(f"\n[Timing] Data {data_idx}, Round {round_idx}, {name}: {subquery_time:.2f}s")
-
-        # --- Save output ---
-
-        final_parsed_results = all_results[-1] if all_results else []
-
-        for person in final_parsed_results:
-            person_idx = person.get('person_idx')
-            if person_idx is not None and person_idx in subquery_times:
-                person['subquery_time'] = round(subquery_times[person_idx], 2)
-
-        result_to_save = {
-            'metadata': {
-                'model_name': args.model_name,
-                'judgement_mode': args.judgement_mode,
-                'memory_system': args.memory_system,
-                'mode': 'agent',
-                'max_steps': args.max_steps,
-            },
-            f'{args.model_name}_sole-planning_results': final_parsed_results,
-            'all_results': all_results,
-            'scratchpads': all_scratchpads,
-        }
-
-        print(f"\n{'=' * 60}")
-        print(f"[Data {data_idx}] GROUP SUMMARY")
-        print(f"{'=' * 60}")
-        print(f"Total persons: {total_rounds}")
-        print(f"Memory system: {args.memory_system}")
+        result_to_save = run_group(args, agent, env_client, recorder, data_idx, memory_system, max_people)
         print(f"Saving to: {output_file}")
-        print(f"{'=' * 60}\n")
 
         with open(output_file, 'w') as f:
             json.dump(result_to_save, f, indent=4, ensure_ascii=False)
