@@ -221,7 +221,9 @@ class MemframeMemorySystem:
         t = traj.current()
         if t is None:
             return
-        t.at(k - 1, None)   # trajectory subtasks are 0-based: S1 is the base person, S<r+1> the r-th joining traveler
+        # trajectory rounds are the travelers: storing the base person comes before the first round (subtask None, S0),
+        # the r-th joining traveler (memframe subtask r + 1) is subtask r - 1 (S<r>), the round its question is scored in
+        t.at(k - 2 if k > 1 else None, None)
         if rec is not None:
             t.write(rec)
 
